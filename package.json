@@ -1,0 +1,9 @@
+{
+  "name": "agentmemory",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Persistent memory infrastructure for AI agents",
+  "workspaces": [
+    "packages/*"
+  ]
+}
