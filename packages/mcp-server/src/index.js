@@ -23,7 +23,7 @@ import { MemoryStore } from './store.js'
 const store = new MemoryStore(process.env.AGENTMEMORY_DB_PATH)
 
 const server = new Server(
-  { name: 'agentmemory', version: '0.1.0' },
+  { name: 'agentmemory', version: '0.2.0' },
   { capabilities: { tools: {}, resources: {} } }
 )
 
@@ -563,6 +563,8 @@ async function main() {
   const transport = new StdioServerTransport()
   await server.connect(transport)
   console.error('AgentMemory MCP server running on stdio')
+  process.on('SIGINT', () => { store.close(); process.exit(0) })
+  process.on('SIGTERM', () => { store.close(); process.exit(0) })
 }
 
 main().catch((error) => {

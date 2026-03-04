@@ -2,10 +2,7 @@
  * AgentMemory Store
  *
  * Local storage engine using sql.js (SQLite compiled to WASM)
- * and simple TF-IDF vector search for semantic recall.
- *
- * In production, this would connect to the AgentMemory cloud API.
- * Locally, it provides full functionality with zero config.
+ * with semantic vector search via Transformers.js and TF-IDF fallback.
  */
 
 import initSqlJs from 'sql.js'
