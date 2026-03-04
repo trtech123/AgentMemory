@@ -41,6 +41,7 @@ export class MemoryStore {
         content TEXT NOT NULL,
         tags TEXT DEFAULT '[]',
         metadata TEXT DEFAULT '{}',
+        embedding BLOB,
         version INTEGER DEFAULT 1,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
@@ -56,6 +57,8 @@ export class MemoryStore {
         id TEXT PRIMARY KEY,
         memory_id TEXT NOT NULL,
         content TEXT NOT NULL,
+        tags TEXT,
+        metadata TEXT,
         version INTEGER NOT NULL,
         created_at TEXT NOT NULL,
         FOREIGN KEY (memory_id) REFERENCES memories(id)
@@ -71,6 +74,11 @@ export class MemoryStore {
       )
     `)
     this._db.run(`CREATE INDEX IF NOT EXISTS idx_search_term ON search_index(term)`)
+
+    // Migrate existing DBs
+    try { this._db.run('ALTER TABLE memories ADD COLUMN embedding BLOB') } catch (e) {}
+    try { this._db.run('ALTER TABLE memory_versions ADD COLUMN tags TEXT') } catch (e) {}
+    try { this._db.run('ALTER TABLE memory_versions ADD COLUMN metadata TEXT') } catch (e) {}
 
     this._db.run(`
       CREATE TABLE IF NOT EXISTS usage_log (
