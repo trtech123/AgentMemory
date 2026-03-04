@@ -186,6 +186,77 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         properties: {},
       },
     },
+    {
+      name: 'memory_namespaces',
+      description:
+        'List all namespaces with their memory counts. Use this to see what memory collections exist.',
+      inputSchema: {
+        type: 'object',
+        properties: {},
+      },
+    },
+    {
+      name: 'memory_delete_namespace',
+      description:
+        'Delete an entire namespace and all its memories permanently. Requires confirm: true to execute.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          namespace: { type: 'string', description: 'Namespace to delete' },
+          confirm: {
+            type: 'boolean',
+            description: 'Must be true to actually delete. If false/omitted, returns count of memories that would be deleted.',
+          },
+        },
+        required: ['namespace'],
+      },
+    },
+    {
+      name: 'memory_export',
+      description:
+        'Export memories as JSON for backup or migration. Exports a single namespace, or all namespaces if omitted. Includes full version history.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          namespace: {
+            type: 'string',
+            description: 'Namespace to export. Omit to export all namespaces.',
+          },
+        },
+      },
+    },
+    {
+      name: 'memory_import',
+      description:
+        'Import memories from a JSON export. Handles conflicts with skip (default) or overwrite mode.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          data: {
+            type: 'object',
+            description: 'The JSON export data (from memory_export output)',
+          },
+          on_conflict: {
+            type: 'string',
+            enum: ['skip', 'overwrite'],
+            description: 'How to handle existing keys: skip (default) or overwrite',
+          },
+        },
+        required: ['data'],
+      },
+    },
+    {
+      name: 'memory_summarize',
+      description:
+        'Get a condensed overview of a namespace: total memories, keys grouped by tag, recent updates, and token usage. Useful for understanding what knowledge is stored without reading every memory.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          namespace: { type: 'string', description: 'Namespace to summarize' },
+        },
+        required: ['namespace'],
+      },
+    },
   ],
 }))
 
@@ -337,6 +408,87 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             },
           ],
         }
+      }
+
+      case 'memory_namespaces': {
+        const namespaces = await store.listNamespaces()
+        if (namespaces.length === 0) {
+          return {
+            content: [{ type: 'text', text: 'No namespaces found. Store a memory to create one.' }],
+          }
+        }
+        const list = namespaces
+          .map((ns) => `- ${ns.namespace} (${ns.count} memories)`)
+          .join('\n')
+        return {
+          content: [{ type: 'text', text: `${namespaces.length} namespaces:\n\n${list}` }],
+        }
+      }
+
+      case 'memory_delete_namespace': {
+        const result = await store.deleteNamespace(args.namespace, args.confirm || false)
+        if (!result.confirmed) {
+          return {
+            content: [{
+              type: 'text',
+              text: `Namespace "${args.namespace}" has ${result.count} memories. Set confirm: true to delete them all permanently.`,
+            }],
+          }
+        }
+        return {
+          content: [{
+            type: 'text',
+            text: `Deleted namespace "${args.namespace}" and ${result.deleted} memories.`,
+          }],
+        }
+      }
+
+      case 'memory_export': {
+        const data = await store.exportNamespace(args.namespace)
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify(data, null, 2),
+          }],
+        }
+      }
+
+      case 'memory_import': {
+        const result = await store.importMemories(args.data, args.on_conflict || 'skip')
+        return {
+          content: [{
+            type: 'text',
+            text: `Import complete: ${result.imported} imported, ${result.skipped} skipped, ${result.overwritten} overwritten.`,
+          }],
+        }
+      }
+
+      case 'memory_summarize': {
+        const summary = await store.summarize(args.namespace)
+        if (!summary) {
+          return {
+            content: [{ type: 'text', text: `Namespace "${args.namespace}" is empty or does not exist.` }],
+          }
+        }
+
+        let text = `Namespace "${summary.namespace}" — ${summary.total_memories} memories, ~${summary.total_tokens.toLocaleString()} tokens\n\n`
+
+        if (Object.keys(summary.by_tag).length > 0) {
+          text += `By tag:\n`
+          for (const [tag, keys] of Object.entries(summary.by_tag)) {
+            text += `  [${tag}]: ${keys.join(', ')}\n`
+          }
+        }
+        if (summary.untagged.length > 0) {
+          text += `  [untagged]: ${summary.untagged.join(', ')}\n`
+        }
+
+        text += `\nRecent updates:\n`
+        for (const r of summary.recent_updates) {
+          text += `  - ${r.key} (v${r.version}, ${r.content_length} chars, ${r.updated_at})\n`
+        }
+
+        return { content: [{ type: 'text', text }] }
       }
 
       default:

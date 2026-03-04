@@ -449,6 +449,167 @@ export class MemoryStore {
     }
   }
 
+  async deleteNamespace(namespace, confirm = false) {
+    await this._ensureReady()
+
+    if (!confirm) {
+      const count = this._queryOne(
+        'SELECT COUNT(*) as count FROM memories WHERE namespace = ?',
+        [namespace]
+      )
+      return { confirmed: false, count: count?.count || 0 }
+    }
+
+    const memories = this._query(
+      'SELECT id FROM memories WHERE namespace = ?',
+      [namespace]
+    )
+
+    for (const m of memories) {
+      this._run('DELETE FROM search_index WHERE memory_id = ?', [m.id])
+      this._run('DELETE FROM memory_versions WHERE memory_id = ?', [m.id])
+    }
+    this._run('DELETE FROM memories WHERE namespace = ?', [namespace])
+    this._persist()
+
+    return { confirmed: true, deleted: memories.length }
+  }
+
+  async exportNamespace(namespace) {
+    await this._ensureReady()
+
+    let sql = 'SELECT * FROM memories'
+    const params = []
+
+    if (namespace) {
+      sql += ' WHERE namespace = ?'
+      params.push(namespace)
+    }
+
+    sql += ' ORDER BY namespace, key'
+    const memories = this._query(sql, params)
+
+    const exported = memories.map(row => {
+      const formatted = this._formatRow(row)
+
+      const versions = this._query(
+        'SELECT content, tags, metadata, version, created_at FROM memory_versions WHERE memory_id = ? ORDER BY version',
+        [row.id]
+      )
+      formatted.versions = versions.map(v => ({
+        content: v.content,
+        tags: v.tags ? JSON.parse(v.tags) : null,
+        metadata: v.metadata ? JSON.parse(v.metadata) : null,
+        version: v.version,
+        created_at: v.created_at,
+      }))
+
+      delete formatted.id
+      delete formatted.score
+      return formatted
+    })
+
+    return {
+      export_version: 1,
+      exported_at: new Date().toISOString(),
+      namespace: namespace || 'all',
+      count: exported.length,
+      memories: exported,
+    }
+  }
+
+  async importMemories(data, onConflict = 'skip') {
+    await this._ensureReady()
+
+    if (data.export_version !== 1) {
+      throw new Error(`Unsupported export version: ${data.export_version}`)
+    }
+
+    let imported = 0
+    let skipped = 0
+    let overwritten = 0
+
+    for (const memory of data.memories) {
+      const existing = this._queryOne(
+        'SELECT id FROM memories WHERE namespace = ? AND key = ?',
+        [memory.namespace, memory.key]
+      )
+
+      if (existing) {
+        if (onConflict === 'skip') {
+          skipped++
+          continue
+        }
+        await this.forget(memory.namespace, memory.key)
+        overwritten++
+      }
+
+      await this.store(
+        memory.namespace,
+        memory.key,
+        memory.content,
+        memory.tags || [],
+        memory.metadata || {}
+      )
+      imported++
+    }
+
+    return { imported, skipped, overwritten }
+  }
+
+  async summarize(namespace) {
+    await this._ensureReady()
+
+    const total = this._queryOne(
+      'SELECT COUNT(*) as count FROM memories WHERE namespace = ?',
+      [namespace]
+    )
+
+    if (!total || total.count === 0) {
+      return null
+    }
+
+    const memories = this._query(
+      'SELECT key, tags, version, updated_at, LENGTH(content) as content_length FROM memories WHERE namespace = ? ORDER BY updated_at DESC',
+      [namespace]
+    )
+
+    const byTag = {}
+    const untagged = []
+    for (const m of memories) {
+      const tags = JSON.parse(m.tags || '[]')
+      if (tags.length === 0) {
+        untagged.push(m.key)
+      } else {
+        for (const tag of tags) {
+          if (!byTag[tag]) byTag[tag] = []
+          byTag[tag].push(m.key)
+        }
+      }
+    }
+
+    const recent = memories.slice(0, 5)
+
+    const tokenTotal = this._queryOne(
+      "SELECT COALESCE(SUM(tokens_used), 0) as total FROM usage_log WHERE operation IN ('store', 'update') AND namespace = ?",
+      [namespace]
+    )
+
+    return {
+      namespace,
+      total_memories: total.count,
+      total_tokens: tokenTotal?.total || 0,
+      by_tag: byTag,
+      untagged,
+      recent_updates: recent.map(m => ({
+        key: m.key,
+        version: m.version,
+        updated_at: m.updated_at,
+        content_length: m.content_length,
+      })),
+    }
+  }
+
   close() {
     if (this._db) {
       this._persist()
