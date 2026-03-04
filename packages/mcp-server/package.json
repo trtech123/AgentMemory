@@ -12,9 +12,17 @@
     "dev": "node --watch src/index.js"
   },
   "dependencies": {
+    "@huggingface/transformers": "^3.8.1",
     "@modelcontextprotocol/sdk": "^1.0.0",
     "sql.js": "^1.11.0"
   },
-  "keywords": ["mcp", "agent", "memory", "ai", "llm", "context"],
+  "keywords": [
+    "mcp",
+    "agent",
+    "memory",
+    "ai",
+    "llm",
+    "context"
+  ],
   "license": "MIT"
 }
