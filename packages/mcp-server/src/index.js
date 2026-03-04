@@ -87,6 +87,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             items: { type: 'string' },
             description: 'Filter results to only memories with these tags',
           },
+          offset: {
+            type: 'number',
+            description: 'Number of results to skip for pagination (default: 0)',
+          },
         },
         required: ['namespace', 'query'],
       },
@@ -161,6 +165,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             items: { type: 'string' },
             description: 'Filter to memories with these tags',
           },
+          limit: {
+            type: 'number',
+            description: 'Maximum number of results (default: 50)',
+          },
+          offset: {
+            type: 'number',
+            description: 'Number of results to skip for pagination (default: 0)',
+          },
         },
         required: ['namespace'],
       },
@@ -207,7 +219,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           args.namespace,
           args.query,
           args.limit || 10,
-          args.tags || []
+          args.tags || [],
+          args.offset || 0
         )
         if (results.length === 0) {
           return {
@@ -280,7 +293,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'memory_list': {
-        const memories = await store.list(args.namespace, args.prefix, args.tags || [])
+        const memories = await store.list(
+          args.namespace,
+          args.prefix,
+          args.tags || [],
+          args.limit || 50,
+          args.offset || 0
+        )
         if (memories.length === 0) {
           return {
             content: [{ type: 'text', text: `No memories in namespace "${args.namespace}"` }],

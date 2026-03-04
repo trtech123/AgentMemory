@@ -12,6 +12,7 @@ import initSqlJs from 'sql.js'
 import { join } from 'path'
 import { mkdirSync, existsSync, readFileSync, writeFileSync } from 'fs'
 import { createHash } from 'crypto'
+import { embed, ensureReady as ensureEmbeddings, vectorToBuffer, bufferToVector, cosineSimilarity, isReady as embeddingsReady } from './embeddings.js'
 
 const DEFAULT_DB_DIR = join(process.env.HOME || process.env.USERPROFILE || '.', '.agentmemory')
 
@@ -186,10 +187,17 @@ export class MemoryStore {
       [id, namespace, key, content, JSON.stringify(tags), JSON.stringify(metadata), now, now]
     )
 
+    // Compute and store embedding
+    ensureEmbeddings()
+    const vector = await embed(`${key} ${content}`)
+    if (vector) {
+      this._run('UPDATE memories SET embedding = ? WHERE id = ?', [vectorToBuffer(vector), id])
+    }
+
     this._run(
-      `INSERT INTO memory_versions (id, memory_id, content, version, created_at)
-       VALUES (?, ?, ?, 1, ?)`,
-      [this._generateId(), id, content, now]
+      `INSERT INTO memory_versions (id, memory_id, content, tags, metadata, version, created_at)
+       VALUES (?, ?, ?, ?, ?, 1, ?)`,
+      [this._generateId(), id, content, JSON.stringify(tags), JSON.stringify(metadata), now]
     )
 
     this._indexMemory(id, `${key} ${content} ${tags.join(' ')}`)
@@ -201,38 +209,66 @@ export class MemoryStore {
     return { id, namespace, key, version: 1, created_at: now, tokens }
   }
 
-  async search(namespace, query, limit = 10, tags = []) {
+  async search(namespace, query, limit = 10, tags = [], offset = 0) {
     await this._ensureReady()
 
+    // Build base WHERE clause for namespace + tags
+    let whereClause = 'WHERE namespace = ?'
+    const whereParams = [namespace]
+    for (const tag of tags) {
+      whereClause += ' AND tags LIKE ?'
+      whereParams.push(`%"${tag}"%`)
+    }
+
+    // Try embedding-based search first
+    if (embeddingsReady()) {
+      const queryVec = await embed(query)
+      if (queryVec) {
+        const rows = this._query(
+          `SELECT * FROM memories ${whereClause} AND embedding IS NOT NULL`,
+          whereParams
+        )
+
+        const scored = rows.map(row => ({
+          ...this._formatRow(row),
+          score: cosineSimilarity(queryVec, bufferToVector(row.embedding)),
+        }))
+
+        scored.sort((a, b) => b.score - a.score)
+        const results = scored.slice(offset, offset + limit)
+
+        const tokensSaved = results.reduce((sum, r) => sum + this._estimateTokens(r.content), 0)
+        this._logUsage('search', namespace, tokensSaved)
+        return results
+      }
+    }
+
+    // Fallback: TF-IDF term matching
     const queryTokens = this._tokenize(query)
     if (queryTokens.length === 0) {
       const rows = this._query(
-        'SELECT * FROM memories WHERE namespace = ? ORDER BY updated_at DESC LIMIT ?',
-        [namespace, limit]
+        `SELECT * FROM memories ${whereClause} ORDER BY updated_at DESC LIMIT ? OFFSET ?`,
+        [...whereParams, limit, offset]
       )
       return rows.map(this._formatRow)
     }
 
     const placeholders = queryTokens.map(() => '?').join(',')
-
-    // Simple term-matching approach (compatible with sql.js)
     const sql = `
-      SELECT m.*, COUNT(si.term) as score
+      SELECT m.*, SUM(si.tf) as score
       FROM search_index si
       JOIN memories m ON m.id = si.memory_id
       WHERE si.term IN (${placeholders})
       AND m.namespace = ?
       ${tags.map(() => ' AND m.tags LIKE ?').join('')}
-      GROUP BY m.id ORDER BY score DESC LIMIT ?
+      GROUP BY m.id ORDER BY score DESC LIMIT ? OFFSET ?
     `
-    const params = [...queryTokens, namespace, ...tags.map((t) => `%"${t}"%`), limit]
-
+    const params = [...queryTokens, namespace, ...tags.map(t => `%"${t}"%`), limit, offset]
     const rows = this._query(sql, params)
     const results = rows.map(this._formatRow)
 
     const tokensSaved = results.reduce((sum, r) => sum + this._estimateTokens(r.content), 0)
     this._logUsage('search', namespace, tokensSaved)
-
     return results
   }
 
@@ -252,7 +288,13 @@ export class MemoryStore {
       )
 
       if (versionRow) {
-        return { ...this._formatRow(memory), content: versionRow.content, version: versionRow.version }
+        const result = this._formatRow(memory)
+        result.content = versionRow.content
+        result.version = versionRow.version
+        if (versionRow.tags) result.tags = JSON.parse(versionRow.tags)
+        if (versionRow.metadata) result.metadata = JSON.parse(versionRow.metadata)
+        this._logUsage('recall', namespace, this._estimateTokens(result.content))
+        return result
       }
     }
 
@@ -292,10 +334,16 @@ export class MemoryStore {
       [content, newTags, newMeta, newVersion, now, existing.id]
     )
 
+    // Re-compute embedding
+    const vector = await embed(`${key} ${content}`)
+    if (vector) {
+      this._run('UPDATE memories SET embedding = ? WHERE id = ?', [vectorToBuffer(vector), existing.id])
+    }
+
     this._run(
-      `INSERT INTO memory_versions (id, memory_id, content, version, created_at)
-       VALUES (?, ?, ?, ?, ?)`,
-      [this._generateId(), existing.id, content, newVersion, now]
+      `INSERT INTO memory_versions (id, memory_id, content, tags, metadata, version, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [this._generateId(), existing.id, content, newTags, newMeta, newVersion, now]
     )
 
     this._indexMemory(existing.id, `${key} ${content} ${(tags || []).join(' ')}`)
@@ -324,7 +372,7 @@ export class MemoryStore {
     return true
   }
 
-  async list(namespace, prefix, tags = []) {
+  async list(namespace, prefix, tags = [], limit = 50, offset = 0) {
     await this._ensureReady()
 
     let sql = 'SELECT * FROM memories WHERE namespace = ?'
@@ -340,7 +388,9 @@ export class MemoryStore {
       params.push(`%"${tag}"%`)
     }
 
-    sql += ' ORDER BY updated_at DESC'
+    sql += ' ORDER BY updated_at DESC LIMIT ? OFFSET ?'
+    params.push(limit, offset)
+
     const rows = this._query(sql, params)
     return rows.map(this._formatRow)
   }
