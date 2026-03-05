@@ -185,7 +185,6 @@ export class MemoryStore {
     )
 
     // Compute and store embedding
-    ensureEmbeddings()
     const vector = await embed(`${key} ${content}`)
     if (vector) {
       this._run('UPDATE memories SET embedding = ? WHERE id = ?', [vectorToBuffer(vector), id])
@@ -247,7 +246,7 @@ export class MemoryStore {
         `SELECT * FROM memories ${whereClause} ORDER BY updated_at DESC LIMIT ? OFFSET ?`,
         [...whereParams, limit, offset]
       )
-      return rows.map(this._formatRow)
+      return rows.map(row => this._formatRow(row))
     }
 
     const placeholders = queryTokens.map(() => '?').join(',')
@@ -262,7 +261,7 @@ export class MemoryStore {
     `
     const params = [...queryTokens, namespace, ...tags.map(t => `%"${t}"%`), limit, offset]
     const rows = this._query(sql, params)
-    const results = rows.map(this._formatRow)
+    const results = rows.map(row => this._formatRow(row))
 
     const tokensSaved = results.reduce((sum, r) => sum + this._estimateTokens(r.content), 0)
     this._logUsage('search', namespace, tokensSaved)
@@ -389,7 +388,7 @@ export class MemoryStore {
     params.push(limit, offset)
 
     const rows = this._query(sql, params)
-    return rows.map(this._formatRow)
+    return rows.map(row => this._formatRow(row))
   }
 
   async listNamespaces() {
@@ -467,6 +466,7 @@ export class MemoryStore {
       this._run('DELETE FROM memory_versions WHERE memory_id = ?', [m.id])
     }
     this._run('DELETE FROM memories WHERE namespace = ?', [namespace])
+    this._run('DELETE FROM usage_log WHERE namespace = ?', [namespace])
     this._persist()
 
     return { confirmed: true, deleted: memories.length }

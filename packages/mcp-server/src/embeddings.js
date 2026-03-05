@@ -6,28 +6,30 @@
 import { pipeline } from '@huggingface/transformers'
 
 let _embedder = null
-let _loading = false
+let _loadingPromise = null
 let _ready = false
 
 /**
  * Lazy-initialize the embedding pipeline.
- * Returns true if ready, false if still loading.
+ * Concurrent callers await the same promise.
  */
 export async function ensureReady() {
   if (_ready) return true
-  if (_loading) return false
-  _loading = true
-  try {
-    _embedder = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2', {
-      dtype: 'fp32',
-    })
-    _ready = true
-    return true
-  } catch (err) {
-    console.error('Failed to load embedding model:', err.message)
-    _loading = false
-    return false
-  }
+  if (_loadingPromise) return _loadingPromise
+  _loadingPromise = (async () => {
+    try {
+      _embedder = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2', {
+        dtype: 'fp32',
+      })
+      _ready = true
+      return true
+    } catch (err) {
+      console.error('Failed to load embedding model:', err.message)
+      _loadingPromise = null
+      return false
+    }
+  })()
+  return _loadingPromise
 }
 
 /**
@@ -55,7 +57,8 @@ export function cosineSimilarity(a, b) {
     normA += a[i] * a[i]
     normB += b[i] * b[i]
   }
-  return dot / (Math.sqrt(normA) * Math.sqrt(normB))
+  const denom = Math.sqrt(normA) * Math.sqrt(normB)
+  return denom === 0 ? 0 : dot / denom
 }
 
 /**
@@ -76,5 +79,6 @@ export function vectorToBuffer(vec) {
  * Deserialize a Buffer (SQLite BLOB) back to a float32 array.
  */
 export function bufferToVector(buf) {
-  return Array.from(new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4))
+  const copy = new Uint8Array(buf).buffer
+  return Array.from(new Float32Array(copy))
 }

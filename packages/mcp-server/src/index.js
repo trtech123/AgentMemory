@@ -4,7 +4,7 @@
  * AgentMemory MCP Server
  *
  * Provides persistent, searchable memory for AI agents via MCP.
- * Works standalone with local SQLite storage, or connects to AgentMemory cloud.
+ * Local-only — stores everything in SQLite at ~/.agentmemory/.
  *
  * Usage in Claude Code settings.json:
  *   { "mcpServers": { "agentmemory": { "command": "npx", "args": ["@agentmemory/mcp-server"] } } }
