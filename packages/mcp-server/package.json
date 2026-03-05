@@ -7,6 +7,9 @@
   "bin": {
     "agentmemory-mcp": "src/index.js"
   },
+  "files": [
+    "src/"
+  ],
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
@@ -22,13 +25,28 @@
   "devDependencies": {
     "vitest": "^3.0.0"
   },
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/trtech123/AgentMemory.git",
+    "directory": "packages/mcp-server"
+  },
+  "homepage": "https://github.com/trtech123/AgentMemory#readme",
+  "bugs": {
+    "url": "https://github.com/trtech123/AgentMemory/issues"
+  },
   "keywords": [
     "mcp",
     "agent",
     "memory",
     "ai",
     "llm",
-    "context"
+    "context",
+    "sqlite",
+    "vector-search",
+    "semantic-search"
   ],
   "license": "MIT"
 }

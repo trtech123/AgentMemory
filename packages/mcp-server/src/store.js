@@ -249,10 +249,9 @@ export class MemoryStore {
        VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)`
     ).run(id, namespace, key, content, JSON.stringify(tags), JSON.stringify(metadata), now, now)
 
-    // Compute and store embedding
+    // Compute and store embedding in vec0 table
     const vector = await embed(`${key} ${content}`)
     if (vector) {
-      this._db.prepare('UPDATE memories SET embedding = ? WHERE id = ?').run(vectorToBuffer(vector), id)
       this._upsertEmbedding(id, vector)
     }
 
@@ -419,10 +418,9 @@ export class MemoryStore {
        WHERE id = ?`
     ).run(content, newTags, newMeta, newVersion, now, existing.id)
 
-    // Re-compute embedding
+    // Re-compute embedding in vec0 table
     const vector = await embed(`${key} ${content}`)
     if (vector) {
-      this._db.prepare('UPDATE memories SET embedding = ? WHERE id = ?').run(vectorToBuffer(vector), existing.id)
       this._upsertEmbedding(existing.id, vector)
     }
 
