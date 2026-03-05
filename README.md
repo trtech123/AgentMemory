@@ -60,7 +60,7 @@ To keep memories separate per project, set `AGENTMEMORY_DB_PATH`:
 
 ## Storage
 
-Memories are stored in a local SQLite database at `~/.agentmemory/memories.db`. The embedding model (`all-MiniLM-L6-v2`, ~23MB) downloads automatically on first use.
+Memories are stored in a local SQLite database at `~/.agentmemory/memories.db` using better-sqlite3 with the [sqlite-vec](https://github.com/asg017/sqlite-vec) extension for fast KNN vector search. The embedding model (`all-MiniLM-L6-v2`, ~23MB) downloads automatically on first use.
 
 ## License
 
