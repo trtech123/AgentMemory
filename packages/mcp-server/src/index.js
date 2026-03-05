@@ -34,7 +34,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'memory_store',
       description:
-        'Store a new memory. Use this to save important information, decisions, patterns, or learnings that should persist across sessions. Memories are stored in namespaces (like folders) with unique keys.',
+        'Store a new memory. Use this to save important information, decisions, patterns, or learnings that should persist across sessions. Memories are stored in namespaces (like folders) with unique keys. Long content is automatically summarized — the summary is stored alongside the full content for efficient recall later.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -253,6 +253,86 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         type: 'object',
         properties: {
           namespace: { type: 'string', description: 'Namespace to summarize' },
+        },
+        required: ['namespace'],
+      },
+    },
+    {
+      name: 'memory_compress',
+      description:
+        'Compress text using extractive summarization. Returns a shorter version keeping the most important sentences. Nothing is saved — the compressed text is returned directly.\n\nTRIGGER: Use this PROACTIVELY when:\n- You receive a large tool result (file contents, search results, API responses) that you need to reference later in the session\n- You are about to paste or summarize a long block of context\n- The conversation is getting long and you want to condense earlier findings\n- Before storing a memory, if the content is very large and you want a preview of what the summary will look like',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          text: {
+            type: 'string',
+            description: 'The text to compress',
+          },
+          ratio: {
+            type: 'number',
+            description: 'Compression ratio — fraction of sentences to keep (0.1 to 0.9, default 0.3). Lower = more aggressive compression.',
+          },
+        },
+        required: ['text'],
+      },
+    },
+    {
+      name: 'memory_snapshot',
+      description:
+        'Store a large session context snapshot. Automatically compresses the content and stores both the full text and a summary. Tagged as "session-snapshot" for easy retrieval.\n\nTRIGGER: Use this PROACTIVELY when:\n- You are about to switch tasks or context within a session — snapshot current progress first\n- A complex investigation or debugging session has produced findings worth preserving\n- The user says they are done for now, pausing, or will continue later\n- You have accumulated significant working context (architecture decisions, code findings, plans) that would be lost on /compact or session end\n- After completing a major subtask, snapshot what was done and what remains',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          namespace: {
+            type: 'string',
+            description: 'Namespace for the snapshot (e.g., "session", "project-x")',
+          },
+          key: {
+            type: 'string',
+            description: 'Unique key for this snapshot (e.g., "session-2024-03-05", "auth-refactor-progress")',
+          },
+          content: {
+            type: 'string',
+            description: 'The session context to snapshot — can be large. Will be auto-compressed.',
+          },
+          tags: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Additional tags (session-snapshot is added automatically)',
+          },
+          metadata: {
+            type: 'object',
+            description: 'Optional metadata (e.g., {"task": "refactor auth", "progress": "60%"})',
+          },
+        },
+        required: ['namespace', 'key', 'content'],
+      },
+    },
+    {
+      name: 'memory_bulk_recall',
+      description:
+        'Recall multiple memories and return a merged compressed summary instead of all individual items. Saves context window space by combining and compressing. Specify memories by keys or by tag filter.\n\nTRIGGER: Use this INSTEAD OF multiple memory_recall calls when:\n- You need context from 2+ memories at once — this is always more efficient than individual recalls\n- Starting a new session and need to load prior context — bulk recall by tag (e.g., "session-snapshot") to get a compressed overview\n- The user asks about a broad topic that spans multiple stored memories\n- You want to review what is known about a project area without filling the context window',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          namespace: {
+            type: 'string',
+            description: 'Namespace to recall from',
+          },
+          keys: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Specific memory keys to recall and merge',
+          },
+          tags: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Recall all memories with these tags and merge them',
+          },
+          ratio: {
+            type: 'number',
+            description: 'Compression ratio (0.1 to 0.9, default 0.25). Lower = more aggressive.',
+          },
         },
         required: ['namespace'],
       },
@@ -489,6 +569,59 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
 
         return { content: [{ type: 'text', text }] }
+      }
+
+      case 'memory_compress': {
+        const compressed = store.compress(args.text, args.ratio)
+        const originalTokens = Math.ceil(args.text.length / 4)
+        const compressedTokens = Math.ceil(compressed.length / 4)
+        const saved = originalTokens - compressedTokens
+        return {
+          content: [{
+            type: 'text',
+            text: `Compressed ${originalTokens} → ${compressedTokens} tokens (saved ${saved}, ${Math.round((saved / originalTokens) * 100)}% reduction)\n\n${compressed}`,
+          }],
+        }
+      }
+
+      case 'memory_snapshot': {
+        const result = await store.snapshot(
+          args.namespace,
+          args.key,
+          args.content,
+          args.tags || [],
+          args.metadata || {}
+        )
+        return {
+          content: [{
+            type: 'text',
+            text: `Snapshot stored: "${args.key}" in "${args.namespace}" (v${result.version}, ${result.tokens} tokens). Auto-compressed summary saved. Recall with memory_recall or use memory_bulk_recall to merge multiple snapshots.`,
+          }],
+        }
+      }
+
+      case 'memory_bulk_recall': {
+        const keys = args.keys || []
+        const tags = args.tags || []
+        if (keys.length === 0 && tags.length === 0) {
+          return {
+            content: [{ type: 'text', text: 'Provide either keys or tags to select memories for bulk recall.' }],
+            isError: true,
+          }
+        }
+        const result = await store.bulkRecall(args.namespace, keys, tags, args.ratio)
+        if (result.items.length === 0) {
+          return {
+            content: [{ type: 'text', text: `No memories found matching the criteria in "${args.namespace}".` }],
+          }
+        }
+        const itemList = result.items.map(m => `  - ${m.key} (v${m.version})`).join('\n')
+        return {
+          content: [{
+            type: 'text',
+            text: `Bulk recall: ${result.stats.memories_count} memories, ${result.stats.original_tokens} → ${result.stats.compressed_tokens} tokens (${result.stats.compression_ratio} ratio)\n\nMemories included:\n${itemList}\n\n--- Merged Summary ---\n${result.merged}`,
+          }],
+        }
       }
 
       default:

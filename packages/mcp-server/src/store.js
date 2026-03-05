@@ -11,6 +11,7 @@ import { join } from 'path'
 import { mkdirSync, existsSync } from 'fs'
 import { randomUUID } from 'crypto'
 import { embed, isReady as embeddingsReady, vectorToBuffer } from './embeddings.js'
+import { summarize, mergeAndSummarize, SUMMARY_THRESHOLD } from './summarizer.js'
 
 const DEFAULT_DB_DIR = join(process.env.HOME || process.env.USERPROFILE || '.', '.agentmemory')
 
@@ -79,6 +80,7 @@ export class MemoryStore {
     try { this._db.exec('ALTER TABLE memories ADD COLUMN embedding BLOB') } catch (e) {}
     try { this._db.exec('ALTER TABLE memory_versions ADD COLUMN tags TEXT') } catch (e) {}
     try { this._db.exec('ALTER TABLE memory_versions ADD COLUMN metadata TEXT') } catch (e) {}
+    try { this._db.exec('ALTER TABLE memories ADD COLUMN summary TEXT') } catch (e) {}
 
     this._db.exec(`
       CREATE TABLE IF NOT EXISTS usage_log (
@@ -211,6 +213,7 @@ export class MemoryStore {
       namespace: row.namespace,
       key: row.key,
       content: row.content,
+      summary: row.summary || null,
       tags: JSON.parse(row.tags || '[]'),
       metadata: JSON.parse(row.metadata || '{}'),
       version: row.version,
@@ -243,11 +246,12 @@ export class MemoryStore {
 
     const now = new Date().toISOString()
     const id = this._generateId()
+    const summary = content.length > SUMMARY_THRESHOLD ? summarize(content) : null
 
     this._db.prepare(
-      `INSERT INTO memories (id, namespace, key, content, tags, metadata, version, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)`
-    ).run(id, namespace, key, content, JSON.stringify(tags), JSON.stringify(metadata), now, now)
+      `INSERT INTO memories (id, namespace, key, content, summary, tags, metadata, version, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`
+    ).run(id, namespace, key, content, summary, JSON.stringify(tags), JSON.stringify(metadata), now, now)
 
     // Compute and store embedding in vec0 table
     const vector = await embed(`${key} ${content}`)
@@ -412,11 +416,12 @@ export class MemoryStore {
     const newMeta = metadata !== undefined
       ? JSON.stringify({ ...JSON.parse(existing.metadata), ...metadata })
       : existing.metadata
+    const newSummary = content.length > SUMMARY_THRESHOLD ? summarize(content) : null
 
     this._db.prepare(
-      `UPDATE memories SET content = ?, tags = ?, metadata = ?, version = ?, updated_at = ?
+      `UPDATE memories SET content = ?, summary = ?, tags = ?, metadata = ?, version = ?, updated_at = ?
        WHERE id = ?`
-    ).run(content, newTags, newMeta, newVersion, now, existing.id)
+    ).run(content, newSummary, newTags, newMeta, newVersion, now, existing.id)
 
     // Re-compute embedding in vec0 table
     const vector = await embed(`${key} ${content}`)
@@ -654,6 +659,59 @@ export class MemoryStore {
         updated_at: m.updated_at,
         content_length: m.content_length,
       })),
+    }
+  }
+
+  compress(text, ratio) {
+    return summarize(text, ratio)
+  }
+
+  async snapshot(namespace, key, content, tags = [], metadata = {}) {
+    const snapshotTags = [...new Set([...tags, 'session-snapshot'])]
+    return this.store(namespace, key, content, snapshotTags, metadata)
+  }
+
+  async bulkRecall(namespace, keys = [], tags = [], ratio) {
+    let memories
+    if (keys.length > 0) {
+      const placeholders = keys.map(() => '?').join(',')
+      let sql = `SELECT * FROM memories WHERE namespace = ? AND key IN (${placeholders})`
+      const params = [namespace, ...keys]
+      memories = this._db.prepare(sql).all(...params)
+    } else if (tags.length > 0) {
+      let sql = 'SELECT * FROM memories WHERE namespace = ?'
+      const params = [namespace]
+      for (const tag of tags) {
+        sql += ' AND tags LIKE ?'
+        params.push(this._escapeTagFilter(tag))
+      }
+      sql += ' ORDER BY updated_at DESC'
+      memories = this._db.prepare(sql).all(...params)
+    } else {
+      throw new Error('Either keys or tags must be provided for bulk recall')
+    }
+
+    if (memories.length === 0) return { items: [], merged: '' }
+
+    const items = memories.map(row => this._formatRow(row))
+    const merged = mergeAndSummarize(
+      items.map(m => ({ key: m.key, content: m.content })),
+      ratio
+    )
+
+    const tokensSaved = items.reduce((sum, m) => sum + this._estimateTokens(m.content), 0)
+    const tokensReturned = this._estimateTokens(merged)
+    this._logUsage('bulk_recall', namespace, tokensSaved)
+
+    return {
+      items: items.map(m => ({ key: m.key, version: m.version, tags: m.tags })),
+      merged,
+      stats: {
+        memories_count: items.length,
+        original_tokens: tokensSaved,
+        compressed_tokens: tokensReturned,
+        compression_ratio: tokensSaved > 0 ? (tokensReturned / tokensSaved).toFixed(2) : '1.00',
+      },
     }
   }
 
