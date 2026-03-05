@@ -23,7 +23,7 @@ import { MemoryStore } from './store.js'
 const store = new MemoryStore(process.env.AGENTMEMORY_DB_PATH)
 
 const server = new Server(
-  { name: 'agentmemory', version: '0.2.0' },
+  { name: 'agentmemory', version: '0.3.0' },
   { capabilities: { tools: {}, resources: {} } }
 )
 
