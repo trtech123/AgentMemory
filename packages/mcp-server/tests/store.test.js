@@ -167,14 +167,14 @@ describe('MemoryStore', () => {
     it('lists memories sorted by updated_at desc', async () => {
       await store.store('ns', 'alpha', 'first')
       await store.store('ns', 'beta', 'second')
-      await store.store('ns', 'gamma', 'third')
+      // Update alpha so it gets the most recent updated_at
+      await store.update('ns', 'alpha', 'first updated')
 
       const result = await store.list('ns')
-      expect(result).toHaveLength(3)
+      expect(result).toHaveLength(2)
       // Most recently updated should be first
-      expect(result[0].key).toBe('gamma')
+      expect(result[0].key).toBe('alpha')
       expect(result[1].key).toBe('beta')
-      expect(result[2].key).toBe('alpha')
     })
 
     it('filters by prefix', async () => {
