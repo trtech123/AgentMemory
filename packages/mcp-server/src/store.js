@@ -26,7 +26,12 @@ export class MemoryStore {
     const SQL = await initSqlJs()
 
     if (existsSync(this._dbPath)) {
-      this._db = new SQL.Database(readFileSync(this._dbPath))
+      try {
+        this._db = new SQL.Database(readFileSync(this._dbPath))
+      } catch (err) {
+        console.error('Database file corrupted, starting fresh:', err.message)
+        this._db = new SQL.Database()
+      }
     } else {
       this._db = new SQL.Database()
     }
@@ -108,7 +113,11 @@ export class MemoryStore {
   }
 
   _persist() {
-    writeFileSync(this._dbPath, Buffer.from(this._db.export()))
+    try {
+      writeFileSync(this._dbPath, Buffer.from(this._db.export()))
+    } catch (err) {
+      console.error('Failed to persist database:', err.message)
+    }
   }
 
   _generateId() {
@@ -124,6 +133,34 @@ export class MemoryStore {
       .replace(/[^a-z0-9\s]/g, ' ')
       .split(/\s+/)
       .filter((t) => t.length > 2)
+  }
+
+  _validate(namespace, key, content) {
+    if (!namespace || typeof namespace !== 'string' || namespace.trim() === '') {
+      throw new Error('namespace is required and must be a non-empty string')
+    }
+    if (!key || typeof key !== 'string' || key.trim() === '') {
+      throw new Error('key is required and must be a non-empty string')
+    }
+    if (namespace.length > 255) {
+      throw new Error('namespace must be 255 characters or less')
+    }
+    if (key.length > 255) {
+      throw new Error('key must be 255 characters or less')
+    }
+    if (content !== undefined && content !== null) {
+      if (typeof content !== 'string') {
+        throw new Error('content must be a string')
+      }
+      if (content.length > 100000) {
+        throw new Error('content must be 100,000 characters or less')
+      }
+    }
+  }
+
+  _escapeTagFilter(tag) {
+    // Tags are stored as JSON arrays, so we match the JSON-encoded form
+    return `%${JSON.stringify(tag)}%`
   }
 
   _query(sql, params = []) {
@@ -165,6 +202,7 @@ export class MemoryStore {
 
   async store(namespace, key, content, tags = [], metadata = {}) {
     await this._ensureReady()
+    this._validate(namespace, key, content)
 
     const existing = this._queryOne(
       'SELECT id, version FROM memories WHERE namespace = ? AND key = ?',
@@ -207,13 +245,19 @@ export class MemoryStore {
 
   async search(namespace, query, limit = 10, tags = [], offset = 0) {
     await this._ensureReady()
+    if (!namespace || typeof namespace !== 'string' || namespace.trim() === '') {
+      throw new Error('namespace is required and must be a non-empty string')
+    }
+    if (!query || typeof query !== 'string' || query.trim() === '') {
+      throw new Error('query is required and must be a non-empty string')
+    }
 
     // Build base WHERE clause for namespace + tags
     let whereClause = 'WHERE namespace = ?'
     const whereParams = [namespace]
     for (const tag of tags) {
       whereClause += ' AND tags LIKE ?'
-      whereParams.push(`%"${tag}"%`)
+      whereParams.push(this._escapeTagFilter(tag))
     }
 
     // Try embedding-based search first
@@ -259,7 +303,7 @@ export class MemoryStore {
       ${tags.map(() => ' AND m.tags LIKE ?').join('')}
       GROUP BY m.id ORDER BY score DESC LIMIT ? OFFSET ?
     `
-    const params = [...queryTokens, namespace, ...tags.map(t => `%"${t}"%`), limit, offset]
+    const params = [...queryTokens, namespace, ...tags.map(t => this._escapeTagFilter(t)), limit, offset]
     const rows = this._query(sql, params)
     const results = rows.map(row => this._formatRow(row))
 
@@ -270,6 +314,7 @@ export class MemoryStore {
 
   async recall(namespace, key, version) {
     await this._ensureReady()
+    this._validate(namespace, key)
 
     if (version) {
       const memory = this._queryOne(
@@ -307,6 +352,7 @@ export class MemoryStore {
 
   async update(namespace, key, content, tags, metadata) {
     await this._ensureReady()
+    this._validate(namespace, key, content)
 
     const existing = this._queryOne(
       'SELECT * FROM memories WHERE namespace = ? AND key = ?',
@@ -353,6 +399,7 @@ export class MemoryStore {
 
   async forget(namespace, key) {
     await this._ensureReady()
+    this._validate(namespace, key)
 
     const existing = this._queryOne(
       'SELECT id FROM memories WHERE namespace = ? AND key = ?',
@@ -370,6 +417,9 @@ export class MemoryStore {
 
   async list(namespace, prefix, tags = [], limit = 50, offset = 0) {
     await this._ensureReady()
+    if (!namespace || typeof namespace !== 'string' || namespace.trim() === '') {
+      throw new Error('namespace is required and must be a non-empty string')
+    }
 
     let sql = 'SELECT * FROM memories WHERE namespace = ?'
     const params = [namespace]
@@ -381,7 +431,7 @@ export class MemoryStore {
 
     for (const tag of (tags || [])) {
       sql += ' AND tags LIKE ?'
-      params.push(`%"${tag}"%`)
+      params.push(this._escapeTagFilter(tag))
     }
 
     sql += ' ORDER BY updated_at DESC LIMIT ? OFFSET ?'
@@ -447,6 +497,9 @@ export class MemoryStore {
 
   async deleteNamespace(namespace, confirm = false) {
     await this._ensureReady()
+    if (!namespace || typeof namespace !== 'string' || namespace.trim() === '') {
+      throw new Error('namespace is required and must be a non-empty string')
+    }
 
     if (!confirm) {
       const count = this._queryOne(
@@ -556,6 +609,9 @@ export class MemoryStore {
 
   async summarize(namespace) {
     await this._ensureReady()
+    if (!namespace || typeof namespace !== 'string' || namespace.trim() === '') {
+      throw new Error('namespace is required and must be a non-empty string')
+    }
 
     const total = this._queryOne(
       'SELECT COUNT(*) as count FROM memories WHERE namespace = ?',
