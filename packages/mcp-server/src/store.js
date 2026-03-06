@@ -13,6 +13,8 @@ import { randomUUID } from 'crypto'
 import { embed, isReady as embeddingsReady, vectorToBuffer } from './embeddings.js'
 import { summarize, mergeAndSummarize, SUMMARY_THRESHOLD } from './summarizer.js'
 
+const MAX_VERSIONS = 20
+const USAGE_LOG_TTL_DAYS = 90
 const DEFAULT_DB_DIR = join(process.env.HOME || process.env.USERPROFILE || '.', '.agentmemory')
 
 export class MemoryStore {
@@ -114,6 +116,12 @@ export class MemoryStore {
 
     // Migration: backfill memory_embeddings from old embedding BLOB column
     this._migrateEmbeddingsToVec0()
+
+    // Clear legacy embedding BLOBs (already migrated to vec0)
+    this._db.exec(`UPDATE memories SET embedding = NULL WHERE embedding IS NOT NULL`)
+
+    // Prune old usage logs
+    this._db.exec(`DELETE FROM usage_log WHERE created_at < datetime('now', '-${USAGE_LOG_TTL_DAYS} days')`)
   }
 
   _migrateEmbeddingsToVec0() {
@@ -200,6 +208,32 @@ export class MemoryStore {
     }
   }
 
+  _pruneVersions(memoryId) {
+    this._db.prepare(
+      `DELETE FROM memory_versions WHERE memory_id = ? AND id NOT IN (
+        SELECT id FROM memory_versions WHERE memory_id = ?
+        ORDER BY version DESC LIMIT ?
+      )`
+    ).run(memoryId, memoryId, MAX_VERSIONS)
+  }
+
+  _ensureSearchIndex(namespace) {
+    const hasIndex = this._db.prepare(
+      `SELECT 1 FROM search_index si
+       JOIN memories m ON m.id = si.memory_id
+       WHERE m.namespace = ? LIMIT 1`
+    ).get(namespace)
+    if (!hasIndex) {
+      const memories = this._db.prepare(
+        'SELECT id, key, content, tags FROM memories WHERE namespace = ?'
+      ).all(namespace)
+      for (const m of memories) {
+        const tags = JSON.parse(m.tags || '[]')
+        this._indexMemory(m.id, `${m.key} ${m.content} ${tags.join(' ')}`)
+      }
+    }
+  }
+
   _upsertEmbedding(memoryId, vector) {
     const buf = vectorToBuffer(vector)
     // Delete old embedding if it exists, then insert new one
@@ -244,30 +278,37 @@ export class MemoryStore {
       return this.update(namespace, key, content, tags, metadata)
     }
 
-    const now = new Date().toISOString()
     const id = this._generateId()
+    const versionId = this._generateId()
+    const now = new Date().toISOString()
     const summary = content.length > SUMMARY_THRESHOLD ? summarize(content) : null
-
-    this._db.prepare(
-      `INSERT INTO memories (id, namespace, key, content, summary, tags, metadata, version, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`
-    ).run(id, namespace, key, content, summary, JSON.stringify(tags), JSON.stringify(metadata), now, now)
-
-    // Compute and store embedding in vec0 table
-    const vector = await embed(`${key} ${content}`)
-    if (vector) {
-      this._upsertEmbedding(id, vector)
-    }
-
-    this._db.prepare(
-      `INSERT INTO memory_versions (id, memory_id, content, tags, metadata, version, created_at)
-       VALUES (?, ?, ?, ?, ?, 1, ?)`
-    ).run(this._generateId(), id, content, JSON.stringify(tags), JSON.stringify(metadata), now)
-
-    this._indexMemory(id, `${key} ${content} ${tags.join(' ')}`)
-
+    const tagsJson = JSON.stringify(tags)
+    const metaJson = JSON.stringify(metadata)
     const tokens = this._estimateTokens(content)
-    this._logUsage('store', namespace, tokens)
+
+    // Async embedding before transaction
+    const vector = await embed(`${key} ${content}`)
+
+    const runTransaction = this._db.transaction(() => {
+      this._db.prepare(
+        `INSERT INTO memories (id, namespace, key, content, summary, tags, metadata, version, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`
+      ).run(id, namespace, key, content, summary, tagsJson, metaJson, now, now)
+
+      if (vector) {
+        this._upsertEmbedding(id, vector)
+      } else {
+        this._indexMemory(id, `${key} ${content} ${tags.join(' ')}`)
+      }
+
+      this._db.prepare(
+        `INSERT INTO memory_versions (id, memory_id, content, tags, metadata, version, created_at)
+         VALUES (?, ?, ?, ?, ?, 1, ?)`
+      ).run(versionId, id, content, tagsJson, metaJson, now)
+
+      this._logUsage('store', namespace, tokens)
+    })
+    runTransaction()
 
     return { id, namespace, key, version: 1, created_at: now, tokens }
   }
@@ -329,6 +370,7 @@ export class MemoryStore {
     }
 
     // Fallback: TF-IDF term matching
+    this._ensureSearchIndex(namespace)
     const queryTokens = this._tokenize(query)
 
     // Build base WHERE clause for namespace + tags
@@ -411,33 +453,39 @@ export class MemoryStore {
     }
 
     const now = new Date().toISOString()
+    const versionId = this._generateId()
     const newVersion = existing.version + 1
     const newTags = tags !== undefined ? JSON.stringify(tags) : existing.tags
     const newMeta = metadata !== undefined
       ? JSON.stringify({ ...JSON.parse(existing.metadata), ...metadata })
       : existing.metadata
     const newSummary = content.length > SUMMARY_THRESHOLD ? summarize(content) : null
-
-    this._db.prepare(
-      `UPDATE memories SET content = ?, summary = ?, tags = ?, metadata = ?, version = ?, updated_at = ?
-       WHERE id = ?`
-    ).run(content, newSummary, newTags, newMeta, newVersion, now, existing.id)
-
-    // Re-compute embedding in vec0 table
-    const vector = await embed(`${key} ${content}`)
-    if (vector) {
-      this._upsertEmbedding(existing.id, vector)
-    }
-
-    this._db.prepare(
-      `INSERT INTO memory_versions (id, memory_id, content, tags, metadata, version, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
-    ).run(this._generateId(), existing.id, content, newTags, newMeta, newVersion, now)
-
-    this._indexMemory(existing.id, `${key} ${content} ${(tags || []).join(' ')}`)
-
     const tokens = this._estimateTokens(content)
-    this._logUsage('update', namespace, tokens)
+
+    // Async embedding before transaction
+    const vector = await embed(`${key} ${content}`)
+
+    const runTransaction = this._db.transaction(() => {
+      this._db.prepare(
+        `UPDATE memories SET content = ?, summary = ?, tags = ?, metadata = ?, version = ?, updated_at = ?
+         WHERE id = ?`
+      ).run(content, newSummary, newTags, newMeta, newVersion, now, existing.id)
+
+      if (vector) {
+        this._upsertEmbedding(existing.id, vector)
+      } else {
+        this._indexMemory(existing.id, `${key} ${content} ${(tags || []).join(' ')}`)
+      }
+
+      this._db.prepare(
+        `INSERT INTO memory_versions (id, memory_id, content, tags, metadata, version, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      ).run(versionId, existing.id, content, newTags, newMeta, newVersion, now)
+
+      this._pruneVersions(existing.id)
+      this._logUsage('update', namespace, tokens)
+    })
+    runTransaction()
 
     return { id: existing.id, namespace, key, version: newVersion, updated_at: now, tokens }
   }
@@ -451,10 +499,13 @@ export class MemoryStore {
 
     if (!existing) return false
 
-    this._db.prepare('DELETE FROM search_index WHERE memory_id = ?').run(existing.id)
-    this._db.prepare('DELETE FROM memory_versions WHERE memory_id = ?').run(existing.id)
-    this._db.prepare('DELETE FROM memory_embeddings WHERE id = ?').run(existing.id)
-    this._db.prepare('DELETE FROM memories WHERE id = ?').run(existing.id)
+    const runTransaction = this._db.transaction(() => {
+      this._db.prepare('DELETE FROM search_index WHERE memory_id = ?').run(existing.id)
+      this._db.prepare('DELETE FROM memory_versions WHERE memory_id = ?').run(existing.id)
+      this._db.prepare('DELETE FROM memory_embeddings WHERE id = ?').run(existing.id)
+      this._db.prepare('DELETE FROM memories WHERE id = ?').run(existing.id)
+    })
+    runTransaction()
     return true
   }
 
@@ -519,19 +570,29 @@ export class MemoryStore {
       return { confirmed: false, count: count?.count || 0 }
     }
 
-    const memories = this._db.prepare(
-      'SELECT id FROM memories WHERE namespace = ?'
-    ).all(namespace)
+    const count = this._db.prepare(
+      'SELECT COUNT(*) as count FROM memories WHERE namespace = ?'
+    ).get(namespace)?.count || 0
 
-    for (const m of memories) {
-      this._db.prepare('DELETE FROM search_index WHERE memory_id = ?').run(m.id)
-      this._db.prepare('DELETE FROM memory_versions WHERE memory_id = ?').run(m.id)
-      this._db.prepare('DELETE FROM memory_embeddings WHERE id = ?').run(m.id)
-    }
-    this._db.prepare('DELETE FROM memories WHERE namespace = ?').run(namespace)
-    this._db.prepare('DELETE FROM usage_log WHERE namespace = ?').run(namespace)
+    const runTransaction = this._db.transaction(() => {
+      // Batch deletes for regular tables
+      this._db.prepare(
+        'DELETE FROM search_index WHERE memory_id IN (SELECT id FROM memories WHERE namespace = ?)'
+      ).run(namespace)
+      this._db.prepare(
+        'DELETE FROM memory_versions WHERE memory_id IN (SELECT id FROM memories WHERE namespace = ?)'
+      ).run(namespace)
+      // Per-row for vec0 virtual table (vec0 may not support subquery in WHERE)
+      const ids = this._db.prepare('SELECT id FROM memories WHERE namespace = ?').all(namespace)
+      const delEmb = this._db.prepare('DELETE FROM memory_embeddings WHERE id = ?')
+      for (const row of ids) delEmb.run(row.id)
+      // Then delete memories and logs
+      this._db.prepare('DELETE FROM memories WHERE namespace = ?').run(namespace)
+      this._db.prepare('DELETE FROM usage_log WHERE namespace = ?').run(namespace)
+    })
+    runTransaction()
 
-    return { confirmed: true, deleted: memories.length }
+    return { confirmed: true, deleted: count }
   }
 
   async exportNamespace(namespace) {
