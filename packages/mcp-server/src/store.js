@@ -7,7 +7,7 @@
 
 import initSqlJs from 'sql.js'
 import { join } from 'path'
-import { mkdirSync, existsSync, readFileSync, writeFileSync } from 'fs'
+import { mkdirSync, existsSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'fs'
 import { randomUUID } from 'crypto'
 import { embed, isReady as embeddingsReady, cosineSimilarity, vectorToBuffer, bufferToVector } from './embeddings.js'
 import { summarize, mergeAndSummarize, SUMMARY_THRESHOLD } from './summarizer.js'
@@ -54,6 +54,22 @@ export class MemoryStore {
     if (this._dbPath === ':memory:') {
       this._db = new SQL.Database()
     } else {
+      // Recovery from interrupted persist
+      const tmpPath = this._dbPath + '.tmp'
+      const bakPath = this._dbPath + '.bak'
+
+      if (existsSync(bakPath) && existsSync(tmpPath)) {
+        // Crash during swap: .bak is the good copy, .tmp is incomplete
+        renameSync(bakPath, this._dbPath)
+        unlinkSync(tmpPath)
+      } else if (existsSync(bakPath) && !existsSync(tmpPath)) {
+        // Swap completed but .bak cleanup failed
+        unlinkSync(bakPath)
+      } else if (existsSync(tmpPath) && !existsSync(bakPath) && !existsSync(this._dbPath)) {
+        // Write completed but rename never started
+        renameSync(tmpPath, this._dbPath)
+      }
+
       if (existsSync(this._dbPath)) {
         this._db = new SQL.Database(readFileSync(this._dbPath))
       } else {
@@ -83,8 +99,30 @@ export class MemoryStore {
   }
 
   persist() {
-    if (this._db && this._dbPath !== ':memory:') {
-      writeFileSync(this._dbPath, Buffer.from(this._db.export()))
+    if (!this._db || this._dbPath === ':memory:') return
+
+    const tmpPath = this._dbPath + '.tmp'
+    const bakPath = this._dbPath + '.bak'
+
+    // Clean up stale .bak from prior crash
+    if (existsSync(bakPath)) {
+      try { unlinkSync(bakPath) } catch (_) {}
+    }
+
+    // Step 1: Write new data to temp file
+    writeFileSync(tmpPath, Buffer.from(this._db.export()))
+
+    // Step 2: If DB exists, move it to backup (Windows-safe: no overwrite)
+    if (existsSync(this._dbPath)) {
+      renameSync(this._dbPath, bakPath)
+    }
+
+    // Step 3: Move temp to DB path
+    renameSync(tmpPath, this._dbPath)
+
+    // Step 4: Clean up backup
+    if (existsSync(bakPath)) {
+      try { unlinkSync(bakPath) } catch (_) {}
     }
   }
 
