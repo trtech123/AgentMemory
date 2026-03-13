@@ -12,6 +12,9 @@ import { randomUUID } from 'crypto'
 import { embed, isReady as embeddingsReady, cosineSimilarity, vectorToBuffer, bufferToVector } from './embeddings.js'
 import { summarize, mergeAndSummarize, SUMMARY_THRESHOLD } from './summarizer.js'
 
+const DEBUG = process.env.DEBUG?.includes('agentmemory')
+function debug(...args) { if (DEBUG) console.error('[agentmemory]', ...args) }
+
 const MAX_VERSIONS = 20
 const USAGE_LOG_TTL_DAYS = 90
 const DEFAULT_DB_DIR = join(process.env.HOME || process.env.USERPROFILE || '.', '.agentmemory')
@@ -60,13 +63,16 @@ export class MemoryStore {
 
       if (existsSync(bakPath) && existsSync(tmpPath)) {
         // Crash during swap: .bak is the good copy, .tmp is incomplete
+        debug('recovery: found .bak + .tmp, restoring .bak')
         renameSync(bakPath, this._dbPath)
         unlinkSync(tmpPath)
       } else if (existsSync(bakPath) && !existsSync(tmpPath)) {
         // Swap completed but .bak cleanup failed
+        debug('recovery: found stale .bak, removing')
         unlinkSync(bakPath)
       } else if (existsSync(tmpPath) && !existsSync(bakPath) && !existsSync(this._dbPath)) {
         // Write completed but rename never started
+        debug('recovery: found .tmp only, promoting to db')
         renameSync(tmpPath, this._dbPath)
       }
 
@@ -134,6 +140,7 @@ export class MemoryStore {
   _markDirty() {
     this._dirty = true
     if (this._debounceTimer) clearTimeout(this._debounceTimer)
+    debug('dirty: scheduling persist in 1s')
     this._debounceTimer = setTimeout(() => {
       try { this.persist() } catch (_) { this._persistFailed = true }
     }, 1000)
@@ -141,6 +148,7 @@ export class MemoryStore {
 
   persist() {
     if (!this._db || this._dbPath === ':memory:') return
+    debug('persist: writing', this._dbPath)
 
     const tmpPath = this._dbPath + '.tmp'
     const bakPath = this._dbPath + '.bak'

@@ -5,6 +5,9 @@
 
 import { pipeline } from '@huggingface/transformers'
 
+const DEBUG = process.env.DEBUG?.includes('agentmemory')
+function debug(...args) { if (DEBUG) console.error('[agentmemory]', ...args) }
+
 let _embedder = null
 let _loadingPromise = null
 let _ready = false
@@ -18,13 +21,16 @@ export async function ensureReady() {
   if (_loadingPromise) return _loadingPromise
   _loadingPromise = (async () => {
     try {
+      debug('loading embedding model Xenova/all-MiniLM-L6-v2')
       _embedder = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2', {
         dtype: 'fp32',
       })
       _ready = true
+      debug('embedding model loaded successfully')
       return true
     } catch (err) {
       console.error('Failed to load embedding model:', err.message)
+      debug('embedding model load failed, will use TF-IDF fallback')
       _loadingPromise = null
       return false
     }
