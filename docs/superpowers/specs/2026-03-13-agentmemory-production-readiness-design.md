@@ -35,7 +35,8 @@ Open-source npm package used by developers integrating memory into their MCP-com
 - Run full test suite, verify 75/75 pass
 - No other changes in this phase
 
-**Files:** `tests/store.test.js`, `tests/search.test.js`, `tests/advanced.test.js`, `tests/compression.test.js`
+**Files (4 failing):** `tests/store.test.js`, `tests/search.test.js`, `tests/advanced.test.js`, `tests/compression.test.js`
+**Files (2 already passing):** `tests/embeddings.test.js`, `tests/summarizer.test.js` — these test pure functions and don't instantiate `MemoryStore`, so they already pass. No changes needed.
 
 ## Phase 2: Atomic Writes
 
@@ -50,8 +51,11 @@ Open-source npm package used by developers integrating memory into their MCP-com
   writeFileSync(tmpPath, Buffer.from(this._db.export()));
   renameSync(tmpPath, this._dbPath);
   ```
-- `renameSync` is atomic on NTFS, ext4, and APFS
-- Add startup recovery in `init()`: if `dbPath + '.tmp'` exists but `dbPath` does not, rename `.tmp` → `dbPath` before loading
+- **Windows safety:** `renameSync` does NOT atomically overwrite an existing file on Windows/NTFS. Use a three-step approach: rename existing DB to `.bak`, rename `.tmp` to DB path, delete `.bak`. If crash occurs between steps, `init()` recovery handles it.
+- **Recovery logic in `init()`:** On startup, check for `.tmp` and `.bak` files:
+  - If `.bak` exists and `.tmp` exists: rename failed mid-swap → rename `.bak` back to DB path, delete `.tmp`
+  - If `.bak` exists but no `.tmp`: swap completed but `.bak` wasn't cleaned up → delete `.bak`
+  - If `.tmp` exists but no `.bak` and no DB: write completed but rename never started → rename `.tmp` to DB path
 
 **Tests to add:**
 - Test that persist creates a valid DB file
@@ -66,16 +70,17 @@ Open-source npm package used by developers integrating memory into their MCP-com
 **Fix:** Add to `index.js`:
 ```js
 process.on('uncaughtException', async (err) => {
-  console.error('Uncaught exception:', err.message);
+  console.error('Uncaught exception:', err?.message || String(err));
   await store.close();
   process.exit(1);
 });
-process.on('unhandledRejection', async (err) => {
-  console.error('Unhandled rejection:', err.message);
+process.on('unhandledRejection', async (reason) => {
+  console.error('Unhandled rejection:', reason?.message || String(reason));
   await store.close();
   process.exit(1);
 });
 ```
+Note: `unhandledRejection` receives a rejection reason that may not be an `Error` object (could be a string, undefined, etc.). Always use optional chaining with a `String()` fallback.
 
 **Problem 2:** `persist()` errors during operations cause inconsistent state — in-memory DB is modified but caller told operation failed.
 **Fix:** Wrap `persist()` in try/catch. Log the error, set `this._persistFailed = true` for retry on next interval, but don't propagate to caller. The in-memory operation succeeded; the disk write is a separate concern.
@@ -109,11 +114,23 @@ _markDirty() {
 }
 ```
 
+**`close()` must clear the debounce timer** before persisting:
+```js
+async close() {
+  if (this._debounceTimer) clearTimeout(this._debounceTimer);
+  if (this._safetyInterval) clearInterval(this._safetyInterval);
+  if (this._dirty) this.persist();
+  this._db.close();
+}
+```
+Without clearing the timer, a pending debounce could fire after `db.close()`, causing an error.
+
 **Tests to add:**
 - Test that read operations do NOT trigger persist
 - Test that write operations set dirty flag
 - Test that close() persists if dirty
 - Test debounce batching (multiple rapid writes → one persist)
+- Test that close() does not error when a debounce timer is pending
 
 ## Phase 5: Binary Embeddings + Cached Search
 
@@ -141,6 +158,7 @@ _markDirty() {
 - Populated on first search per namespace (load all embeddings once)
 - Invalidated on `store()`, `update()`, `forget()`, `deleteNamespace()` for the affected namespace
 - Cache has no TTL — invalidation-based only (correct since we're single-process)
+- **Import optimization:** `importMemories()` calls `store()` internally for each memory. To avoid cache thrash (invalidate + rebuild per imported memory), `importMemories()` should set a `_batchMode = true` flag that suppresses cache invalidation during import, then invalidate all affected namespaces once at the end.
 
 ### 5c: Chunked Similarity
 
@@ -148,7 +166,7 @@ _markDirty() {
 
 **Fix:**
 - Process similarity in chunks of 1000 embeddings
-- Maintain a top-K min-heap (where K = requested limit, default 10) across chunks
+- Maintain a top-K result set across chunks. For K <= 50 (typical), use a simple sorted-insert into a bounded array rather than a min-heap — simpler code, negligible performance difference at small K
 - This bounds memory usage to `chunk_size * embedding_dim * 4 bytes` = ~1.5MB per chunk regardless of namespace size
 
 **Tests to add:**
@@ -220,6 +238,7 @@ _markDirty() {
 |------|------------|
 | Test fix reveals other broken behavior | Phase 1 is isolated; review failures before proceeding |
 | Atomic rename not atomic on network drives | Document: local filesystem only, no NFS/SMB |
+| `renameSync` doesn't atomically overwrite on Windows/NTFS | Three-step swap (rename → rename → delete) with recovery logic in `init()` |
 | Embedding cache grows unbounded | Single-process local tool; cache is bounded by total memories. Add cache size monitoring in Phase 6 if needed |
 | Chunked search returns different ordering than brute-force for tied scores | Accept: tie-breaking order is implementation detail, not a contract |
 | Users miss migration instructions | Bold warning in README, npm postinstall message, error on detecting old DB format |
