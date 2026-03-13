@@ -157,3 +157,27 @@ describe('close() safety', () => {
     expect(() => s.close()).not.toThrow()
   })
 })
+
+describe('persist error isolation', () => {
+  it('store() succeeds even if persist fails', async () => {
+    const s = new MemoryStore(':memory:')
+    await s.init()
+
+    // Monkey-patch persist to throw
+    const originalPersist = s.persist.bind(s)
+    s.persist = () => { throw new Error('disk full') }
+
+    // store should still succeed (the in-memory write happened)
+    const result = await s.store('ns', 'k1', 'data despite disk failure')
+    expect(result).toHaveProperty('id')
+    expect(result.version).toBe(1)
+
+    // Verify the data is in memory
+    s.persist = originalPersist // restore for recall
+    const recalled = await s.recall('ns', 'k1')
+    expect(recalled).not.toBeNull()
+    expect(recalled.content).toBe('data despite disk failure')
+
+    s.close()
+  })
+})

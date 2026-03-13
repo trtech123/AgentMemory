@@ -21,6 +21,7 @@ import {
 import { MemoryStore } from './store.js'
 
 const store = new MemoryStore(process.env.AGENTMEMORY_DB_PATH)
+await store.init()
 
 const server = new Server(
   { name: 'agentmemory', version: '0.3.0' },
@@ -696,8 +697,25 @@ async function main() {
   const transport = new StdioServerTransport()
   await server.connect(transport)
   console.error('AgentMemory MCP server running on stdio')
-  process.on('SIGINT', () => { store.close(); process.exit(0) })
-  process.on('SIGTERM', () => { store.close(); process.exit(0) })
+  // Global error handlers — close() is sync so it works in exit handlers
+  process.on('uncaughtException', (err) => {
+    console.error('Uncaught exception:', err?.message || String(err))
+    try { store.close() } catch (_) {}
+    process.exit(1)
+  })
+  process.on('unhandledRejection', (reason) => {
+    console.error('Unhandled rejection:', reason?.message || String(reason))
+    try { store.close() } catch (_) {}
+    process.exit(1)
+  })
+
+  // Graceful shutdown
+  for (const signal of ['SIGINT', 'SIGTERM']) {
+    process.on(signal, () => {
+      try { store.close() } catch (_) {}
+      process.exit(0)
+    })
+  }
 }
 
 main().catch((error) => {
