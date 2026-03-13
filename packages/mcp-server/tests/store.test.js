@@ -234,6 +234,40 @@ describe('MemoryStore', () => {
       const longContent = 'x'.repeat(100001)
       await expect(store.store('ns', 'key', longContent)).rejects.toThrow(/100,000/)
     })
+
+    it('rejects non-array tags', async () => {
+      await expect(store.store('ns', 'k', 'content', 'not-an-array')).rejects.toThrow(/tags/)
+    })
+
+    it('rejects tags with non-string elements', async () => {
+      await expect(store.store('ns', 'k', 'content', [123])).rejects.toThrow(/tags/)
+    })
+
+    it('rejects more than 50 tags', async () => {
+      const tooMany = Array.from({ length: 51 }, (_, i) => `tag${i}`)
+      await expect(store.store('ns', 'k', 'content', tooMany)).rejects.toThrow(/50/)
+    })
+
+    it('rejects tags longer than 100 characters', async () => {
+      await expect(store.store('ns', 'k', 'content', ['a'.repeat(101)])).rejects.toThrow(/100/)
+    })
+
+    it('rejects non-object metadata', async () => {
+      await expect(store.store('ns', 'k', 'content', [], 'not-an-object')).rejects.toThrow(/metadata/)
+    })
+
+    it('rejects array as metadata', async () => {
+      await expect(store.store('ns', 'k', 'content', [], [1, 2, 3])).rejects.toThrow(/metadata/)
+    })
+
+    it('rejects null as metadata', async () => {
+      await expect(store.store('ns', 'k', 'content', [], null)).rejects.toThrow(/metadata/)
+    })
+
+    it('rejects metadata over 10KB', async () => {
+      const big = { data: 'x'.repeat(11000) }
+      await expect(store.store('ns', 'k', 'content', [], big)).rejects.toThrow(/10KB/)
+    })
   })
 
   describe('usage log pruning', () => {

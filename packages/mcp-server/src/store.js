@@ -284,6 +284,35 @@ export class MemoryStore {
     }
   }
 
+  _validateTags(tags) {
+    if (tags === undefined || tags === null) return
+    if (!Array.isArray(tags)) {
+      throw new Error('tags must be an array')
+    }
+    if (tags.length > 50) {
+      throw new Error('tags must have 50 or fewer items')
+    }
+    for (const tag of tags) {
+      if (typeof tag !== 'string') {
+        throw new Error('each tag in tags must be a string')
+      }
+      if (tag.length > 100) {
+        throw new Error('each tag must be 100 characters or less')
+      }
+    }
+  }
+
+  _validateMetadata(metadata) {
+    if (metadata === undefined) return
+    if (metadata === null || typeof metadata !== 'object' || Array.isArray(metadata)) {
+      throw new Error('metadata must be a plain object')
+    }
+    const serialized = JSON.stringify(metadata)
+    if (serialized.length > 10240) {
+      throw new Error('metadata must be under 10KB when serialized')
+    }
+  }
+
   _escapeTagFilter(tag) {
     return `%${JSON.stringify(tag)}%`
   }
@@ -372,6 +401,8 @@ export class MemoryStore {
 
   async store(namespace, key, content, tags = [], metadata = {}) {
     this._validate(namespace, key, content)
+    this._validateTags(tags)
+    this._validateMetadata(metadata)
 
     const existing = queryGet(this._db,
       'SELECT id, version FROM memories WHERE namespace = ? AND key = ?',
@@ -550,6 +581,8 @@ export class MemoryStore {
 
   async update(namespace, key, content, tags, metadata) {
     this._validate(namespace, key, content)
+    this._validateTags(tags)
+    this._validateMetadata(metadata)
 
     const existing = queryGet(this._db,
       'SELECT * FROM memories WHERE namespace = ? AND key = ?',
