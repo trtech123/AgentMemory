@@ -123,6 +123,8 @@ export class MemoryStore {
       )
     `)
 
+    db.run(`CREATE INDEX IF NOT EXISTS idx_versions_memory ON memory_versions(memory_id, version)`)
+
     db.run(`
       CREATE TABLE IF NOT EXISTS search_index (
         memory_id TEXT NOT NULL,
