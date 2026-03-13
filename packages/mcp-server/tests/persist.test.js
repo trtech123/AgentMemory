@@ -182,6 +182,30 @@ describe('persist error isolation', () => {
   })
 })
 
+describe('Old format detection', () => {
+  it('detects JSON embeddings and throws with upgrade instructions', async () => {
+    // Create a DB with JSON-style embedding (simulating v0.3.0 format)
+    const testDir2 = join(tmpdir(), `agentmemory-test-${Date.now()}-${Math.random().toString(36).slice(2)}`)
+    mkdirSync(testDir2, { recursive: true })
+    let store = new MemoryStore(testDir2)
+    await store.init()
+
+    // Manually insert a row with a JSON string embedding (old format)
+    const db = store._db
+    db.run(`INSERT INTO memories (id, namespace, key, content, embedding, version, created_at, updated_at)
+            VALUES ('test1', 'ns', 'k1', 'content', '[0.1, 0.2, 0.3]', 1, datetime('now'), datetime('now'))`)
+    store.persist()
+    store.close()
+    store = null
+
+    // Reopen — should detect old format
+    const store2 = new MemoryStore(testDir2)
+    await expect(store2.init()).rejects.toThrow(/v0\.3\.0/)
+
+    rmSync(testDir2, { recursive: true, force: true })
+  })
+})
+
 describe('Debounced Persist', () => {
   let testDir
   let store

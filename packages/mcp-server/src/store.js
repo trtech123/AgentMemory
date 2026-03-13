@@ -79,6 +79,18 @@ export class MemoryStore {
 
     this._initSchema()
 
+    // Detect old v0.3.0 JSON embedding format
+    const sample = queryGet(this._db,
+      "SELECT embedding FROM memories WHERE embedding IS NOT NULL LIMIT 1"
+    )
+    if (sample?.embedding && typeof sample.embedding === 'string' && sample.embedding.startsWith('[')) {
+      throw new Error(
+        'AgentMemory v0.4.0 detected a v0.3.0 database with JSON embeddings. ' +
+        'To upgrade: export your data with v0.3.0 (memory_export), upgrade to v0.4.0, ' +
+        'then import (memory_import). See README for details.'
+      )
+    }
+
     // Safety persist every 5 seconds — only if dirty or a prior persist failed
     if (this._dbPath !== ':memory:') {
       this._persistInterval = setInterval(() => {
