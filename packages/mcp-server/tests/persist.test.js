@@ -181,3 +181,72 @@ describe('persist error isolation', () => {
     s.close()
   })
 })
+
+describe('Debounced Persist', () => {
+  let testDir
+  let store
+
+  beforeEach(() => {
+    testDir = join(tmpdir(), `agentmemory-test-${Date.now()}-${Math.random().toString(36).slice(2)}`)
+    mkdirSync(testDir, { recursive: true })
+  })
+
+  afterEach(() => {
+    if (store) {
+      try { store.close() } catch (_) {}
+      store = null
+    }
+    rmSync(testDir, { recursive: true, force: true })
+  })
+
+  it('read operations do not trigger persist', async () => {
+    const s = new MemoryStore(':memory:')
+    await s.init()
+    await s.store('ns', 'k1', 'content')
+
+    let persistCount = 0
+    const originalPersist = s.persist.bind(s)
+    s.persist = () => { persistCount++; return originalPersist() }
+
+    persistCount = 0 // reset after store's persist
+
+    // These should NOT trigger persist
+    await s.recall('ns', 'k1')
+    await s.search('ns', 'content')
+    await s.list('ns')
+    await s.getStats()
+    await s.summarize('ns')
+    await s.bulkRecall('ns', ['k1'])
+
+    expect(persistCount).toBe(0)
+    s.close()
+  })
+
+  it('write operations set dirty flag', async () => {
+    const s = new MemoryStore(':memory:')
+    await s.init()
+
+    expect(s._dirty).toBeFalsy()
+    await s.store('ns', 'k1', 'content')
+    expect(s._dirty).toBe(true)
+
+    s.close()
+  })
+
+  it('close() persists if dirty', async () => {
+    store = new MemoryStore(testDir)
+    await store.init()
+    await store.store('ns', 'k1', 'dirty data')
+
+    // close should persist
+    store.close()
+    store = null
+
+    // Verify
+    const store2 = new MemoryStore(testDir)
+    await store2.init()
+    const recalled = await store2.recall('ns', 'k1')
+    expect(recalled).not.toBeNull()
+    store2.close()
+  })
+})

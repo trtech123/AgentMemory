@@ -79,9 +79,19 @@ export class MemoryStore {
 
     this._initSchema()
 
-    // Auto-persist every 5 seconds
+    // Safety persist every 5 seconds — only if dirty or a prior persist failed
     if (this._dbPath !== ':memory:') {
-      this._persistInterval = setInterval(() => this.persist(), 5000)
+      this._persistInterval = setInterval(() => {
+        if (this._dirty || this._persistFailed) {
+          try {
+            this.persist()
+            this._dirty = false
+            this._persistFailed = false
+          } catch (_) {
+            this._persistFailed = true
+          }
+        }
+      }, 5000)
     }
   }
 
@@ -97,6 +107,16 @@ export class MemoryStore {
     this._db = null
     this._persistInterval = null
     this._persistFailed = false
+    this._dirty = false
+    this._debounceTimer = null
+  }
+
+  _markDirty() {
+    this._dirty = true
+    if (this._debounceTimer) clearTimeout(this._debounceTimer)
+    this._debounceTimer = setTimeout(() => {
+      try { this.persist() } catch (_) { this._persistFailed = true }
+    }, 1000)
   }
 
   persist() {
@@ -126,6 +146,7 @@ export class MemoryStore {
       try { unlinkSync(bakPath) } catch (_) {}
     }
 
+    this._dirty = false
     this._persistFailed = false
   }
 
@@ -372,7 +393,7 @@ export class MemoryStore {
     )
 
     this._logUsage('store', namespace, tokens)
-    try { this.persist() } catch (_) { this._persistFailed = true }
+    this._markDirty()
 
     return { id, namespace, key, version: 1, created_at: now, tokens }
   }
@@ -413,7 +434,6 @@ export class MemoryStore {
 
           const tokensSaved = results.reduce((sum, r) => sum + this._estimateTokens(r.content), 0)
           this._logUsage('search', namespace, tokensSaved)
-          try { this.persist() } catch (_) { this._persistFailed = true }
           return results
         }
       }
@@ -454,7 +474,6 @@ export class MemoryStore {
 
     const tokensSaved = results.reduce((sum, r) => sum + this._estimateTokens(r.content), 0)
     this._logUsage('search', namespace, tokensSaved)
-    try { this.persist() } catch (_) { this._persistFailed = true }
     return results
   }
 
@@ -480,7 +499,6 @@ export class MemoryStore {
         if (versionRow.tags) result.tags = JSON.parse(versionRow.tags)
         if (versionRow.metadata) result.metadata = JSON.parse(versionRow.metadata)
         this._logUsage('recall', namespace, this._estimateTokens(result.content))
-        try { this.persist() } catch (_) { this._persistFailed = true }
         return result
       }
     }
@@ -493,7 +511,6 @@ export class MemoryStore {
 
     const result = this._formatRow(row)
     this._logUsage('recall', namespace, this._estimateTokens(result.content))
-    try { this.persist() } catch (_) { this._persistFailed = true }
     return result
   }
 
@@ -542,7 +559,7 @@ export class MemoryStore {
 
     this._pruneVersions(existing.id)
     this._logUsage('update', namespace, tokens)
-    try { this.persist() } catch (_) { this._persistFailed = true }
+    this._markDirty()
 
     return { id: existing.id, namespace, key, version: newVersion, updated_at: now, tokens }
   }
@@ -560,7 +577,7 @@ export class MemoryStore {
     queryRun(this._db, 'DELETE FROM search_index WHERE memory_id = ?', [existing.id])
     queryRun(this._db, 'DELETE FROM memory_versions WHERE memory_id = ?', [existing.id])
     queryRun(this._db, 'DELETE FROM memories WHERE id = ?', [existing.id])
-    try { this.persist() } catch (_) { this._persistFailed = true }
+    this._markDirty()
     return true
   }
 
@@ -641,7 +658,7 @@ export class MemoryStore {
     )
     queryRun(this._db, 'DELETE FROM memories WHERE namespace = ?', [namespace])
     queryRun(this._db, 'DELETE FROM usage_log WHERE namespace = ?', [namespace])
-    try { this.persist() } catch (_) { this._persistFailed = true }
+    this._markDirty()
 
     return { confirmed: true, deleted: count }
   }
@@ -819,7 +836,6 @@ export class MemoryStore {
     const tokensSaved = items.reduce((sum, m) => sum + this._estimateTokens(m.content), 0)
     const tokensReturned = this._estimateTokens(merged)
     this._logUsage('bulk_recall', namespace, tokensSaved)
-    try { this.persist() } catch (_) { this._persistFailed = true }
 
     return {
       items: items.map(m => ({ key: m.key, version: m.version, tags: m.tags })),
@@ -835,14 +851,21 @@ export class MemoryStore {
 
   close() {
     if (!this._db) return // double-close guard
+    if (this._debounceTimer) {
+      clearTimeout(this._debounceTimer)
+      this._debounceTimer = null
+    }
     if (this._persistInterval) {
       clearInterval(this._persistInterval)
       this._persistInterval = null
     }
-    try {
-      this.persist()
-    } catch (err) {
-      console.error('Persist failed on close:', err?.message || String(err))
+    if (this._dirty) {
+      try {
+        this.persist()
+        this._dirty = false
+      } catch (err) {
+        console.error('Persist failed on close:', err?.message || String(err))
+      }
     }
     this._db.close()
     this._db = null
