@@ -1,42 +1,97 @@
 /**
  * AgentMemory Store
  *
- * Local storage engine using better-sqlite3 + sqlite-vec
+ * Local storage engine using sql.js (WASM SQLite — no native deps)
  * with semantic vector search via Transformers.js and TF-IDF fallback.
  */
 
-import Database from 'better-sqlite3'
-import * as sqliteVec from 'sqlite-vec'
+import initSqlJs from 'sql.js'
 import { join } from 'path'
-import { mkdirSync, existsSync } from 'fs'
+import { mkdirSync, existsSync, readFileSync, writeFileSync } from 'fs'
 import { randomUUID } from 'crypto'
-import { embed, isReady as embeddingsReady, vectorToBuffer } from './embeddings.js'
+import { embed, isReady as embeddingsReady, cosineSimilarity, vectorToBuffer, bufferToVector } from './embeddings.js'
 import { summarize, mergeAndSummarize, SUMMARY_THRESHOLD } from './summarizer.js'
 
 const MAX_VERSIONS = 20
 const USAGE_LOG_TTL_DAYS = 90
 const DEFAULT_DB_DIR = join(process.env.HOME || process.env.USERPROFILE || '.', '.agentmemory')
 
+// sql.js query helpers — convert stmt-based API into better-sqlite3-like .get/.all
+function queryGet(db, sql, params = []) {
+  const stmt = db.prepare(sql)
+  stmt.bind(params)
+  let row = null
+  if (stmt.step()) {
+    const cols = stmt.getColumnNames()
+    const vals = stmt.get()
+    row = Object.fromEntries(cols.map((c, i) => [c, vals[i]]))
+  }
+  stmt.free()
+  return row
+}
+
+function queryAll(db, sql, params = []) {
+  const stmt = db.prepare(sql)
+  stmt.bind(params)
+  const rows = []
+  while (stmt.step()) {
+    const cols = stmt.getColumnNames()
+    const vals = stmt.get()
+    rows.push(Object.fromEntries(cols.map((c, i) => [c, vals[i]])))
+  }
+  stmt.free()
+  return rows
+}
+
+function queryRun(db, sql, params = []) {
+  db.run(sql, params)
+}
+
 export class MemoryStore {
+  async init() {
+    const SQL = await initSqlJs()
+
+    if (this._dbPath === ':memory:') {
+      this._db = new SQL.Database()
+    } else {
+      if (existsSync(this._dbPath)) {
+        this._db = new SQL.Database(readFileSync(this._dbPath))
+      } else {
+        this._db = new SQL.Database()
+      }
+    }
+
+    this._initSchema()
+
+    // Auto-persist every 5 seconds
+    if (this._dbPath !== ':memory:') {
+      this._persistInterval = setInterval(() => this.persist(), 5000)
+    }
+  }
+
   constructor(dbPath) {
     if (dbPath === ':memory:') {
       this._dir = null
       this._dbPath = ':memory:'
-      this._db = new Database(':memory:')
     } else {
       this._dir = dbPath || DEFAULT_DB_DIR
       this._dbPath = join(this._dir, 'memories.db')
       if (!existsSync(this._dir)) mkdirSync(this._dir, { recursive: true })
-      this._db = new Database(this._dbPath)
     }
+    this._db = null
+    this._persistInterval = null
+  }
 
-    this._db.pragma('journal_mode = WAL')
-    sqliteVec.load(this._db)
-    this._initSchema()
+  persist() {
+    if (this._db && this._dbPath !== ':memory:') {
+      writeFileSync(this._dbPath, Buffer.from(this._db.export()))
+    }
   }
 
   _initSchema() {
-    this._db.exec(`
+    const db = this._db
+
+    db.run(`
       CREATE TABLE IF NOT EXISTS memories (
         id TEXT PRIMARY KEY,
         namespace TEXT NOT NULL,
@@ -44,18 +99,18 @@ export class MemoryStore {
         content TEXT NOT NULL,
         tags TEXT DEFAULT '[]',
         metadata TEXT DEFAULT '{}',
-        embedding BLOB,
+        embedding TEXT,
         version INTEGER DEFAULT 1,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         UNIQUE(namespace, key)
       )
     `)
-    this._db.exec(`CREATE INDEX IF NOT EXISTS idx_memories_namespace ON memories(namespace)`)
-    this._db.exec(`CREATE INDEX IF NOT EXISTS idx_memories_key ON memories(namespace, key)`)
-    this._db.exec(`CREATE INDEX IF NOT EXISTS idx_memories_updated ON memories(updated_at)`)
+    db.run(`CREATE INDEX IF NOT EXISTS idx_memories_namespace ON memories(namespace)`)
+    db.run(`CREATE INDEX IF NOT EXISTS idx_memories_key ON memories(namespace, key)`)
+    db.run(`CREATE INDEX IF NOT EXISTS idx_memories_updated ON memories(updated_at)`)
 
-    this._db.exec(`
+    db.run(`
       CREATE TABLE IF NOT EXISTS memory_versions (
         id TEXT PRIMARY KEY,
         memory_id TEXT NOT NULL,
@@ -68,7 +123,7 @@ export class MemoryStore {
       )
     `)
 
-    this._db.exec(`
+    db.run(`
       CREATE TABLE IF NOT EXISTS search_index (
         memory_id TEXT NOT NULL,
         term TEXT NOT NULL,
@@ -76,15 +131,15 @@ export class MemoryStore {
         FOREIGN KEY (memory_id) REFERENCES memories(id)
       )
     `)
-    this._db.exec(`CREATE INDEX IF NOT EXISTS idx_search_term ON search_index(term)`)
+    db.run(`CREATE INDEX IF NOT EXISTS idx_search_term ON search_index(term)`)
 
     // Migrate existing DBs — add columns if missing
-    try { this._db.exec('ALTER TABLE memories ADD COLUMN embedding BLOB') } catch (e) {}
-    try { this._db.exec('ALTER TABLE memory_versions ADD COLUMN tags TEXT') } catch (e) {}
-    try { this._db.exec('ALTER TABLE memory_versions ADD COLUMN metadata TEXT') } catch (e) {}
-    try { this._db.exec('ALTER TABLE memories ADD COLUMN summary TEXT') } catch (e) {}
+    try { db.run('ALTER TABLE memories ADD COLUMN embedding TEXT') } catch (e) {}
+    try { db.run('ALTER TABLE memory_versions ADD COLUMN tags TEXT') } catch (e) {}
+    try { db.run('ALTER TABLE memory_versions ADD COLUMN metadata TEXT') } catch (e) {}
+    try { db.run('ALTER TABLE memories ADD COLUMN summary TEXT') } catch (e) {}
 
-    this._db.exec(`
+    db.run(`
       CREATE TABLE IF NOT EXISTS usage_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         operation TEXT NOT NULL,
@@ -94,60 +149,20 @@ export class MemoryStore {
       )
     `)
 
-    // Create vec0 virtual table for vector search
-    this._db.exec(`
-      CREATE VIRTUAL TABLE IF NOT EXISTS memory_embeddings USING vec0(
-        id text primary key,
-        embedding float[384]
-      )
-    `)
-
     // Backfill token counts for existing memories that predate usage_log
-    const hasLogs = this._db.prepare('SELECT COUNT(*) as count FROM usage_log').get()
+    const hasLogs = queryGet(db, 'SELECT COUNT(*) as count FROM usage_log')
     if ((hasLogs?.count || 0) === 0) {
-      const allMemories = this._db.prepare('SELECT namespace, content FROM memories').all()
-      const insertLog = this._db.prepare(
-        'INSERT INTO usage_log (operation, namespace, tokens_used, created_at) VALUES (?, ?, ?, ?)'
-      )
+      const allMemories = queryAll(db, 'SELECT namespace, content FROM memories')
       for (const m of allMemories) {
-        insertLog.run('store', m.namespace, Math.ceil(m.content.length / 4), new Date().toISOString())
+        queryRun(db,
+          'INSERT INTO usage_log (operation, namespace, tokens_used, created_at) VALUES (?, ?, ?, ?)',
+          [('store'), m.namespace, Math.ceil(m.content.length / 4), new Date().toISOString()]
+        )
       }
     }
 
-    // Migration: backfill memory_embeddings from old embedding BLOB column
-    this._migrateEmbeddingsToVec0()
-
-    // Clear legacy embedding BLOBs (already migrated to vec0)
-    this._db.exec(`UPDATE memories SET embedding = NULL WHERE embedding IS NOT NULL`)
-
     // Prune old usage logs
-    this._db.exec(`DELETE FROM usage_log WHERE created_at < datetime('now', '-${USAGE_LOG_TTL_DAYS} days')`)
-  }
-
-  _migrateEmbeddingsToVec0() {
-    // Check if there are memories with embeddings in the BLOB column
-    // that haven't been inserted into the vec0 table yet
-    const rows = this._db.prepare(
-      `SELECT m.id, m.embedding FROM memories m
-       WHERE m.embedding IS NOT NULL
-       AND m.id NOT IN (SELECT id FROM memory_embeddings)`
-    ).all()
-
-    if (rows.length === 0) return
-
-    const insertVec = this._db.prepare(
-      'INSERT INTO memory_embeddings(id, embedding) VALUES (?, ?)'
-    )
-    const migrate = this._db.transaction(() => {
-      for (const row of rows) {
-        try {
-          insertVec.run(row.id, row.embedding)
-        } catch (e) {
-          // Skip rows with invalid embeddings
-        }
-      }
-    })
-    migrate()
+    db.run(`DELETE FROM usage_log WHERE created_at < datetime('now', '-' || ? || ' days')`, [USAGE_LOG_TTL_DAYS])
   }
 
   _generateId() {
@@ -186,12 +201,11 @@ export class MemoryStore {
   }
 
   _escapeTagFilter(tag) {
-    // Tags are stored as JSON arrays, so we match the JSON-encoded form
     return `%${JSON.stringify(tag)}%`
   }
 
   _indexMemory(memoryId, content) {
-    this._db.prepare('DELETE FROM search_index WHERE memory_id = ?').run(memoryId)
+    queryRun(this._db, 'DELETE FROM search_index WHERE memory_id = ?', [memoryId])
     const tokens = this._tokenize(content)
     if (tokens.length === 0) return
 
@@ -200,33 +214,36 @@ export class MemoryStore {
       freq[token] = (freq[token] || 0) + 1
     }
 
-    const insert = this._db.prepare(
-      'INSERT INTO search_index (memory_id, term, tf) VALUES (?, ?, ?)'
-    )
     for (const [term, count] of Object.entries(freq)) {
-      insert.run(memoryId, term, count / tokens.length)
+      queryRun(this._db,
+        'INSERT INTO search_index (memory_id, term, tf) VALUES (?, ?, ?)',
+        [memoryId, term, count / tokens.length]
+      )
     }
   }
 
   _pruneVersions(memoryId) {
-    this._db.prepare(
+    queryRun(this._db,
       `DELETE FROM memory_versions WHERE memory_id = ? AND id NOT IN (
         SELECT id FROM memory_versions WHERE memory_id = ?
         ORDER BY version DESC LIMIT ?
-      )`
-    ).run(memoryId, memoryId, MAX_VERSIONS)
+      )`,
+      [memoryId, memoryId, MAX_VERSIONS]
+    )
   }
 
   _ensureSearchIndex(namespace) {
-    const hasIndex = this._db.prepare(
-      `SELECT 1 FROM search_index si
+    const hasIndex = queryGet(this._db,
+      `SELECT 1 as found FROM search_index si
        JOIN memories m ON m.id = si.memory_id
-       WHERE m.namespace = ? LIMIT 1`
-    ).get(namespace)
+       WHERE m.namespace = ? LIMIT 1`,
+      [namespace]
+    )
     if (!hasIndex) {
-      const memories = this._db.prepare(
-        'SELECT id, key, content, tags FROM memories WHERE namespace = ?'
-      ).all(namespace)
+      const memories = queryAll(this._db,
+        'SELECT id, key, content, tags FROM memories WHERE namespace = ?',
+        [namespace]
+      )
       for (const m of memories) {
         const tags = JSON.parse(m.tags || '[]')
         this._indexMemory(m.id, `${m.key} ${m.content} ${tags.join(' ')}`)
@@ -235,10 +252,12 @@ export class MemoryStore {
   }
 
   _upsertEmbedding(memoryId, vector) {
-    const buf = vectorToBuffer(vector)
-    // Delete old embedding if it exists, then insert new one
-    this._db.prepare('DELETE FROM memory_embeddings WHERE id = ?').run(memoryId)
-    this._db.prepare('INSERT INTO memory_embeddings(id, embedding) VALUES (?, ?)').run(memoryId, buf)
+    // Store embedding as JSON text in the memories table
+    const embeddingJson = JSON.stringify(vector)
+    queryRun(this._db,
+      'UPDATE memories SET embedding = ? WHERE id = ?',
+      [embeddingJson, memoryId]
+    )
   }
 
   _formatRow(row) {
@@ -262,17 +281,19 @@ export class MemoryStore {
   }
 
   _logUsage(operation, namespace, tokensUsed = 0) {
-    this._db.prepare(
-      'INSERT INTO usage_log (operation, namespace, tokens_used, created_at) VALUES (?, ?, ?, ?)'
-    ).run(operation, namespace || null, tokensUsed, new Date().toISOString())
+    queryRun(this._db,
+      'INSERT INTO usage_log (operation, namespace, tokens_used, created_at) VALUES (?, ?, ?, ?)',
+      [operation, namespace || null, tokensUsed, new Date().toISOString()]
+    )
   }
 
   async store(namespace, key, content, tags = [], metadata = {}) {
     this._validate(namespace, key, content)
 
-    const existing = this._db.prepare(
-      'SELECT id, version FROM memories WHERE namespace = ? AND key = ?'
-    ).get(namespace, key)
+    const existing = queryGet(this._db,
+      'SELECT id, version FROM memories WHERE namespace = ? AND key = ?',
+      [namespace, key]
+    )
 
     if (existing) {
       return this.update(namespace, key, content, tags, metadata)
@@ -286,29 +307,29 @@ export class MemoryStore {
     const metaJson = JSON.stringify(metadata)
     const tokens = this._estimateTokens(content)
 
-    // Async embedding before transaction
+    // Async embedding
     const vector = await embed(`${key} ${content}`)
 
-    const runTransaction = this._db.transaction(() => {
-      this._db.prepare(
-        `INSERT INTO memories (id, namespace, key, content, summary, tags, metadata, version, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`
-      ).run(id, namespace, key, content, summary, tagsJson, metaJson, now, now)
+    queryRun(this._db,
+      `INSERT INTO memories (id, namespace, key, content, summary, tags, metadata, version, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+      [id, namespace, key, content, summary, tagsJson, metaJson, now, now]
+    )
 
-      if (vector) {
-        this._upsertEmbedding(id, vector)
-      } else {
-        this._indexMemory(id, `${key} ${content} ${tags.join(' ')}`)
-      }
+    if (vector) {
+      this._upsertEmbedding(id, vector)
+    } else {
+      this._indexMemory(id, `${key} ${content} ${tags.join(' ')}`)
+    }
 
-      this._db.prepare(
-        `INSERT INTO memory_versions (id, memory_id, content, tags, metadata, version, created_at)
-         VALUES (?, ?, ?, ?, ?, 1, ?)`
-      ).run(versionId, id, content, tagsJson, metaJson, now)
+    queryRun(this._db,
+      `INSERT INTO memory_versions (id, memory_id, content, tags, metadata, version, created_at)
+       VALUES (?, ?, ?, ?, ?, 1, ?)`,
+      [versionId, id, content, tagsJson, metaJson, now]
+    )
 
-      this._logUsage('store', namespace, tokens)
-    })
-    runTransaction()
+    this._logUsage('store', namespace, tokens)
+    this.persist()
 
     return { id, namespace, key, version: 1, created_at: now, tokens }
   }
@@ -321,49 +342,35 @@ export class MemoryStore {
       throw new Error('query is required and must be a non-empty string')
     }
 
-    // Try embedding-based search first using sqlite-vec KNN
+    // Try embedding-based search first — in-memory cosine similarity
     if (embeddingsReady()) {
       const queryVec = await embed(query)
       if (queryVec) {
-        const queryBuf = vectorToBuffer(queryVec)
-        // Over-fetch from vec0 to account for namespace/tag filtering
-        const knnLimit = Math.max(50, limit * 5)
-        const vecResults = this._db.prepare(
-          'SELECT id, distance FROM memory_embeddings WHERE embedding MATCH ? AND k = ?'
-        ).all(queryBuf, knnLimit)
+        // Get all memories with embeddings in this namespace
+        let sql = 'SELECT * FROM memories WHERE namespace = ? AND embedding IS NOT NULL'
+        const params = [namespace]
 
-        if (vecResults.length > 0) {
-          // Build a set of candidate IDs
-          const distanceMap = new Map()
-          for (const vr of vecResults) {
-            distanceMap.set(vr.id, vr.distance)
-          }
+        for (const tag of tags) {
+          sql += ' AND tags LIKE ?'
+          params.push(this._escapeTagFilter(tag))
+        }
 
-          const candidateIds = vecResults.map(vr => vr.id)
-          const placeholders = candidateIds.map(() => '?').join(',')
+        const rows = queryAll(this._db, sql, params)
 
-          // Filter by namespace and tags
-          let sql = `SELECT * FROM memories WHERE id IN (${placeholders}) AND namespace = ?`
-          const params = [...candidateIds, namespace]
-
-          for (const tag of tags) {
-            sql += ' AND tags LIKE ?'
-            params.push(this._escapeTagFilter(tag))
-          }
-
-          const rows = this._db.prepare(sql).all(...params)
-
-          // Score = 1 / (1 + distance) and sort
-          const scored = rows.map(row => ({
-            ...this._formatRow(row),
-            score: 1 / (1 + distanceMap.get(row.id)),
-          }))
+        if (rows.length > 0) {
+          // Score each by cosine similarity
+          const scored = rows.map(row => {
+            const storedVec = JSON.parse(row.embedding)
+            const score = cosineSimilarity(queryVec, storedVec)
+            return { ...this._formatRow(row), score }
+          })
 
           scored.sort((a, b) => b.score - a.score)
           const results = scored.slice(offset, offset + limit)
 
           const tokensSaved = results.reduce((sum, r) => sum + this._estimateTokens(r.content), 0)
           this._logUsage('search', namespace, tokensSaved)
+          this.persist()
           return results
         }
       }
@@ -373,7 +380,6 @@ export class MemoryStore {
     this._ensureSearchIndex(namespace)
     const queryTokens = this._tokenize(query)
 
-    // Build base WHERE clause for namespace + tags
     let whereClause = 'WHERE namespace = ?'
     const whereParams = [namespace]
     for (const tag of tags) {
@@ -382,9 +388,10 @@ export class MemoryStore {
     }
 
     if (queryTokens.length === 0) {
-      const rows = this._db.prepare(
-        `SELECT * FROM memories ${whereClause} ORDER BY updated_at DESC LIMIT ? OFFSET ?`
-      ).all(...whereParams, limit, offset)
+      const rows = queryAll(this._db,
+        `SELECT * FROM memories ${whereClause} ORDER BY updated_at DESC LIMIT ? OFFSET ?`,
+        [...whereParams, limit, offset]
+      )
       return rows.map(row => this._formatRow(row))
     }
 
@@ -399,11 +406,12 @@ export class MemoryStore {
       GROUP BY m.id ORDER BY score DESC LIMIT ? OFFSET ?
     `
     const params = [...queryTokens, namespace, ...tags.map(t => this._escapeTagFilter(t)), limit, offset]
-    const rows = this._db.prepare(sql).all(...params)
+    const rows = queryAll(this._db, sql, params)
     const results = rows.map(row => this._formatRow(row))
 
     const tokensSaved = results.reduce((sum, r) => sum + this._estimateTokens(r.content), 0)
     this._logUsage('search', namespace, tokensSaved)
+    this.persist()
     return results
   }
 
@@ -411,14 +419,16 @@ export class MemoryStore {
     this._validate(namespace, key)
 
     if (version) {
-      const memory = this._db.prepare(
-        'SELECT * FROM memories WHERE namespace = ? AND key = ?'
-      ).get(namespace, key)
+      const memory = queryGet(this._db,
+        'SELECT * FROM memories WHERE namespace = ? AND key = ?',
+        [namespace, key]
+      )
       if (!memory) return null
 
-      const versionRow = this._db.prepare(
-        'SELECT * FROM memory_versions WHERE memory_id = ? AND version = ?'
-      ).get(memory.id, version)
+      const versionRow = queryGet(this._db,
+        'SELECT * FROM memory_versions WHERE memory_id = ? AND version = ?',
+        [memory.id, version]
+      )
 
       if (versionRow) {
         const result = this._formatRow(memory)
@@ -427,26 +437,30 @@ export class MemoryStore {
         if (versionRow.tags) result.tags = JSON.parse(versionRow.tags)
         if (versionRow.metadata) result.metadata = JSON.parse(versionRow.metadata)
         this._logUsage('recall', namespace, this._estimateTokens(result.content))
+        this.persist()
         return result
       }
     }
 
-    const row = this._db.prepare(
-      'SELECT * FROM memories WHERE namespace = ? AND key = ?'
-    ).get(namespace, key)
+    const row = queryGet(this._db,
+      'SELECT * FROM memories WHERE namespace = ? AND key = ?',
+      [namespace, key]
+    )
     if (!row) return null
 
     const result = this._formatRow(row)
     this._logUsage('recall', namespace, this._estimateTokens(result.content))
+    this.persist()
     return result
   }
 
   async update(namespace, key, content, tags, metadata) {
     this._validate(namespace, key, content)
 
-    const existing = this._db.prepare(
-      'SELECT * FROM memories WHERE namespace = ? AND key = ?'
-    ).get(namespace, key)
+    const existing = queryGet(this._db,
+      'SELECT * FROM memories WHERE namespace = ? AND key = ?',
+      [namespace, key]
+    )
 
     if (!existing) {
       return this.store(namespace, key, content, tags, metadata)
@@ -462,30 +476,30 @@ export class MemoryStore {
     const newSummary = content.length > SUMMARY_THRESHOLD ? summarize(content) : null
     const tokens = this._estimateTokens(content)
 
-    // Async embedding before transaction
+    // Async embedding
     const vector = await embed(`${key} ${content}`)
 
-    const runTransaction = this._db.transaction(() => {
-      this._db.prepare(
-        `UPDATE memories SET content = ?, summary = ?, tags = ?, metadata = ?, version = ?, updated_at = ?
-         WHERE id = ?`
-      ).run(content, newSummary, newTags, newMeta, newVersion, now, existing.id)
+    queryRun(this._db,
+      `UPDATE memories SET content = ?, summary = ?, tags = ?, metadata = ?, version = ?, updated_at = ?
+       WHERE id = ?`,
+      [content, newSummary, newTags, newMeta, newVersion, now, existing.id]
+    )
 
-      if (vector) {
-        this._upsertEmbedding(existing.id, vector)
-      } else {
-        this._indexMemory(existing.id, `${key} ${content} ${(tags || []).join(' ')}`)
-      }
+    if (vector) {
+      this._upsertEmbedding(existing.id, vector)
+    } else {
+      this._indexMemory(existing.id, `${key} ${content} ${(tags || []).join(' ')}`)
+    }
 
-      this._db.prepare(
-        `INSERT INTO memory_versions (id, memory_id, content, tags, metadata, version, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`
-      ).run(versionId, existing.id, content, newTags, newMeta, newVersion, now)
+    queryRun(this._db,
+      `INSERT INTO memory_versions (id, memory_id, content, tags, metadata, version, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [versionId, existing.id, content, newTags, newMeta, newVersion, now]
+    )
 
-      this._pruneVersions(existing.id)
-      this._logUsage('update', namespace, tokens)
-    })
-    runTransaction()
+    this._pruneVersions(existing.id)
+    this._logUsage('update', namespace, tokens)
+    this.persist()
 
     return { id: existing.id, namespace, key, version: newVersion, updated_at: now, tokens }
   }
@@ -493,19 +507,17 @@ export class MemoryStore {
   async forget(namespace, key) {
     this._validate(namespace, key)
 
-    const existing = this._db.prepare(
-      'SELECT id FROM memories WHERE namespace = ? AND key = ?'
-    ).get(namespace, key)
+    const existing = queryGet(this._db,
+      'SELECT id FROM memories WHERE namespace = ? AND key = ?',
+      [namespace, key]
+    )
 
     if (!existing) return false
 
-    const runTransaction = this._db.transaction(() => {
-      this._db.prepare('DELETE FROM search_index WHERE memory_id = ?').run(existing.id)
-      this._db.prepare('DELETE FROM memory_versions WHERE memory_id = ?').run(existing.id)
-      this._db.prepare('DELETE FROM memory_embeddings WHERE id = ?').run(existing.id)
-      this._db.prepare('DELETE FROM memories WHERE id = ?').run(existing.id)
-    })
-    runTransaction()
+    queryRun(this._db, 'DELETE FROM search_index WHERE memory_id = ?', [existing.id])
+    queryRun(this._db, 'DELETE FROM memory_versions WHERE memory_id = ?', [existing.id])
+    queryRun(this._db, 'DELETE FROM memories WHERE id = ?', [existing.id])
+    this.persist()
     return true
   }
 
@@ -530,25 +542,25 @@ export class MemoryStore {
     sql += ' ORDER BY updated_at DESC LIMIT ? OFFSET ?'
     params.push(limit, offset)
 
-    const rows = this._db.prepare(sql).all(...params)
+    const rows = queryAll(this._db, sql, params)
     return rows.map(row => this._formatRow(row))
   }
 
   async listNamespaces() {
-    return this._db.prepare(
+    return queryAll(this._db,
       'SELECT namespace, COUNT(*) as count FROM memories GROUP BY namespace ORDER BY namespace'
-    ).all()
+    )
   }
 
   async getStats() {
-    const tokensStored = this._db.prepare(
+    const tokensStored = queryGet(this._db,
       "SELECT COALESCE(SUM(tokens_used), 0) as total FROM usage_log WHERE operation IN ('store', 'update')"
-    ).get()
-    const tokensSaved = this._db.prepare(
+    )
+    const tokensSaved = queryGet(this._db,
       "SELECT COALESCE(SUM(tokens_used), 0) as total FROM usage_log WHERE operation IN ('search', 'recall')"
-    ).get()
-    const memoryCount = this._db.prepare('SELECT COUNT(*) as count FROM memories').get()
-    const namespaceCount = this._db.prepare('SELECT COUNT(DISTINCT namespace) as count FROM memories').get()
+    )
+    const memoryCount = queryGet(this._db, 'SELECT COUNT(*) as count FROM memories')
+    const namespaceCount = queryGet(this._db, 'SELECT COUNT(DISTINCT namespace) as count FROM memories')
 
     return {
       total_tokens_stored: tokensStored?.total || 0,
@@ -564,33 +576,29 @@ export class MemoryStore {
     }
 
     if (!confirm) {
-      const count = this._db.prepare(
-        'SELECT COUNT(*) as count FROM memories WHERE namespace = ?'
-      ).get(namespace)
+      const count = queryGet(this._db,
+        'SELECT COUNT(*) as count FROM memories WHERE namespace = ?',
+        [namespace]
+      )
       return { confirmed: false, count: count?.count || 0 }
     }
 
-    const count = this._db.prepare(
-      'SELECT COUNT(*) as count FROM memories WHERE namespace = ?'
-    ).get(namespace)?.count || 0
+    const count = queryGet(this._db,
+      'SELECT COUNT(*) as count FROM memories WHERE namespace = ?',
+      [namespace]
+    )?.count || 0
 
-    const runTransaction = this._db.transaction(() => {
-      // Batch deletes for regular tables
-      this._db.prepare(
-        'DELETE FROM search_index WHERE memory_id IN (SELECT id FROM memories WHERE namespace = ?)'
-      ).run(namespace)
-      this._db.prepare(
-        'DELETE FROM memory_versions WHERE memory_id IN (SELECT id FROM memories WHERE namespace = ?)'
-      ).run(namespace)
-      // Per-row for vec0 virtual table (vec0 may not support subquery in WHERE)
-      const ids = this._db.prepare('SELECT id FROM memories WHERE namespace = ?').all(namespace)
-      const delEmb = this._db.prepare('DELETE FROM memory_embeddings WHERE id = ?')
-      for (const row of ids) delEmb.run(row.id)
-      // Then delete memories and logs
-      this._db.prepare('DELETE FROM memories WHERE namespace = ?').run(namespace)
-      this._db.prepare('DELETE FROM usage_log WHERE namespace = ?').run(namespace)
-    })
-    runTransaction()
+    queryRun(this._db,
+      'DELETE FROM search_index WHERE memory_id IN (SELECT id FROM memories WHERE namespace = ?)',
+      [namespace]
+    )
+    queryRun(this._db,
+      'DELETE FROM memory_versions WHERE memory_id IN (SELECT id FROM memories WHERE namespace = ?)',
+      [namespace]
+    )
+    queryRun(this._db, 'DELETE FROM memories WHERE namespace = ?', [namespace])
+    queryRun(this._db, 'DELETE FROM usage_log WHERE namespace = ?', [namespace])
+    this.persist()
 
     return { confirmed: true, deleted: count }
   }
@@ -605,14 +613,15 @@ export class MemoryStore {
     }
 
     sql += ' ORDER BY namespace, key'
-    const memories = this._db.prepare(sql).all(...params)
+    const memories = queryAll(this._db, sql, params)
 
     const exported = memories.map(row => {
       const formatted = this._formatRow(row)
 
-      const versions = this._db.prepare(
-        'SELECT content, tags, metadata, version, created_at FROM memory_versions WHERE memory_id = ? ORDER BY version'
-      ).all(row.id)
+      const versions = queryAll(this._db,
+        'SELECT content, tags, metadata, version, created_at FROM memory_versions WHERE memory_id = ? ORDER BY version',
+        [row.id]
+      )
       formatted.versions = versions.map(v => ({
         content: v.content,
         tags: v.tags ? JSON.parse(v.tags) : null,
@@ -645,9 +654,10 @@ export class MemoryStore {
     let overwritten = 0
 
     for (const memory of data.memories) {
-      const existing = this._db.prepare(
-        'SELECT id FROM memories WHERE namespace = ? AND key = ?'
-      ).get(memory.namespace, memory.key)
+      const existing = queryGet(this._db,
+        'SELECT id FROM memories WHERE namespace = ? AND key = ?',
+        [memory.namespace, memory.key]
+      )
 
       if (existing) {
         if (onConflict === 'skip') {
@@ -676,17 +686,19 @@ export class MemoryStore {
       throw new Error('namespace is required and must be a non-empty string')
     }
 
-    const total = this._db.prepare(
-      'SELECT COUNT(*) as count FROM memories WHERE namespace = ?'
-    ).get(namespace)
+    const total = queryGet(this._db,
+      'SELECT COUNT(*) as count FROM memories WHERE namespace = ?',
+      [namespace]
+    )
 
     if (!total || total.count === 0) {
       return null
     }
 
-    const memories = this._db.prepare(
-      'SELECT key, tags, version, updated_at, LENGTH(content) as content_length FROM memories WHERE namespace = ? ORDER BY updated_at DESC'
-    ).all(namespace)
+    const memories = queryAll(this._db,
+      'SELECT key, tags, version, updated_at, LENGTH(content) as content_length FROM memories WHERE namespace = ? ORDER BY updated_at DESC',
+      [namespace]
+    )
 
     const byTag = {}
     const untagged = []
@@ -704,9 +716,10 @@ export class MemoryStore {
 
     const recent = memories.slice(0, 5)
 
-    const tokenTotal = this._db.prepare(
-      "SELECT COALESCE(SUM(tokens_used), 0) as total FROM usage_log WHERE operation IN ('store', 'update') AND namespace = ?"
-    ).get(namespace)
+    const tokenTotal = queryGet(this._db,
+      "SELECT COALESCE(SUM(tokens_used), 0) as total FROM usage_log WHERE operation IN ('store', 'update') AND namespace = ?",
+      [namespace]
+    )
 
     return {
       namespace,
@@ -738,7 +751,7 @@ export class MemoryStore {
       const placeholders = keys.map(() => '?').join(',')
       let sql = `SELECT * FROM memories WHERE namespace = ? AND key IN (${placeholders})`
       const params = [namespace, ...keys]
-      memories = this._db.prepare(sql).all(...params)
+      memories = queryAll(this._db, sql, params)
     } else if (tags.length > 0) {
       let sql = 'SELECT * FROM memories WHERE namespace = ?'
       const params = [namespace]
@@ -747,7 +760,7 @@ export class MemoryStore {
         params.push(this._escapeTagFilter(tag))
       }
       sql += ' ORDER BY updated_at DESC'
-      memories = this._db.prepare(sql).all(...params)
+      memories = queryAll(this._db, sql, params)
     } else {
       throw new Error('Either keys or tags must be provided for bulk recall')
     }
@@ -763,6 +776,7 @@ export class MemoryStore {
     const tokensSaved = items.reduce((sum, m) => sum + this._estimateTokens(m.content), 0)
     const tokensReturned = this._estimateTokens(merged)
     this._logUsage('bulk_recall', namespace, tokensSaved)
+    this.persist()
 
     return {
       items: items.map(m => ({ key: m.key, version: m.version, tags: m.tags })),
@@ -777,7 +791,11 @@ export class MemoryStore {
   }
 
   close() {
+    if (this._persistInterval) {
+      clearInterval(this._persistInterval)
+    }
     if (this._db) {
+      this.persist()
       this._db.close()
     }
   }

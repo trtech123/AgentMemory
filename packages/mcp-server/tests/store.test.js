@@ -235,4 +235,29 @@ describe('MemoryStore', () => {
       await expect(store.store('ns', 'key', longContent)).rejects.toThrow(/100,000/)
     })
   })
+
+  describe('usage log pruning', () => {
+    it('prunes usage logs older than 90 days on init', async () => {
+      // Insert an old log entry, re-init, verify it's pruned
+      const db = store._db
+      db.run(
+        "INSERT INTO usage_log (operation, namespace, tokens_used, created_at) VALUES (?, ?, ?, ?)",
+        ['store', 'ns', 100, '2020-01-01T00:00:00.000Z']
+      )
+      // Verify it's there
+      const before = db.prepare("SELECT COUNT(*) as count FROM usage_log WHERE created_at < '2021-01-01'")
+      before.step()
+      expect(before.get()[0]).toBe(1)
+      before.free()
+
+      // Re-init triggers pruning
+      store._initSchema()
+
+      // Old entry should be pruned
+      const after = db.prepare("SELECT COUNT(*) as count FROM usage_log WHERE created_at < '2021-01-01'")
+      after.step()
+      expect(after.get()[0]).toBe(0)
+      after.free()
+    })
+  })
 })
