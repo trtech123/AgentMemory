@@ -831,12 +831,17 @@ export class MemoryStore {
   }
 
   close() {
+    if (!this._db) return // double-close guard
     if (this._persistInterval) {
       clearInterval(this._persistInterval)
+      this._persistInterval = null
     }
-    if (this._db) {
+    try {
       this.persist()
-      this._db.close()
+    } catch (err) {
+      console.error('Persist failed on close:', err?.message || String(err))
     }
+    this._db.close()
+    this._db = null
   }
 }

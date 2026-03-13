@@ -117,3 +117,43 @@ describe('Atomic Persist', () => {
     store2.close()
   })
 })
+
+describe('close() safety', () => {
+  it('does not throw when called twice', async () => {
+    const s = new MemoryStore(':memory:')
+    await s.init()
+    s.close()
+    expect(() => s.close()).not.toThrow()
+  })
+
+  it('persists dirty data on close', async () => {
+    const testDir = join(tmpdir(), `agentmemory-test-${Date.now()}-${Math.random().toString(36).slice(2)}`)
+    mkdirSync(testDir, { recursive: true })
+    let store = new MemoryStore(testDir)
+    await store.init()
+    await store.store('ns', 'k1', 'important')
+    // Don't call persist() — close should handle it
+
+    // Bypass the auto-persist by closing immediately
+    store.close()
+    store = null
+
+    // Reopen and verify data is there
+    const store2 = new MemoryStore(testDir)
+    await store2.init()
+    const recalled = await store2.recall('ns', 'k1')
+    expect(recalled).not.toBeNull()
+    expect(recalled.content).toBe('important')
+    store2.close()
+
+    rmSync(testDir, { recursive: true, force: true })
+  })
+
+  it('completes even if persist throws', async () => {
+    const s = new MemoryStore(':memory:')
+    await s.init()
+    // Force persist to fail by corrupting _dbPath
+    s._dbPath = '/nonexistent/path/db'
+    expect(() => s.close()).not.toThrow()
+  })
+})
