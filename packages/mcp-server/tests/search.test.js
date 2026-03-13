@@ -113,6 +113,41 @@ describe('MemoryStore search', () => {
   })
 })
 
+describe('Embedding cache', () => {
+  let store
+  beforeEach(async () => { store = new MemoryStore(':memory:'); await store.init() })
+  afterEach(() => { store.close() })
+
+  it('new memories appear in search results after store', async () => {
+    await store.store('ns', 'doc1', 'cats are wonderful furry pets')
+
+    // First search populates cache
+    const r1 = await store.search('ns', 'cats pets')
+    expect(r1).toHaveLength(1)
+
+    // Store new memory — should invalidate cache
+    await store.store('ns', 'doc2', 'dogs are loyal furry companions')
+
+    // Second search should include the new memory
+    const r2 = await store.search('ns', 'furry pets companions')
+    expect(r2.length).toBeGreaterThanOrEqual(2)
+  })
+
+  it('deleted memories disappear from search results', async () => {
+    await store.store('ns', 'doc1', 'temporary data to be deleted')
+    await store.store('ns', 'doc2', 'permanent data to keep')
+
+    // Populate cache
+    await store.search('ns', 'data')
+
+    // Delete — should invalidate cache
+    await store.forget('ns', 'doc1')
+
+    const results = await store.search('ns', 'temporary deleted data')
+    expect(results.every(r => r.key !== 'doc1')).toBe(true)
+  })
+})
+
 describe('Binary embedding storage', () => {
   let store
   beforeEach(async () => { store = new MemoryStore(':memory:'); await store.init() })

@@ -109,6 +109,14 @@ export class MemoryStore {
     this._persistFailed = false
     this._dirty = false
     this._debounceTimer = null
+    this._embeddingCache = new Map() // namespace -> Map<memoryId, Float32Array>
+    this._batchMode = false
+  }
+
+  _invalidateEmbeddingCache(namespace) {
+    if (!this._batchMode) {
+      this._embeddingCache.delete(namespace)
+    }
   }
 
   _markDirty() {
@@ -392,6 +400,7 @@ export class MemoryStore {
     )
 
     this._logUsage('store', namespace, tokens)
+    this._invalidateEmbeddingCache(namespace)
     this._markDirty()
 
     return { id, namespace, key, version: 1, created_at: now, tokens }
@@ -409,6 +418,20 @@ export class MemoryStore {
     if (embeddingsReady()) {
       const queryVec = await embed(query)
       if (queryVec) {
+        // Build/use embedding cache for this namespace
+        if (!this._embeddingCache.has(namespace)) {
+          const allRows = queryAll(this._db,
+            'SELECT id, embedding FROM memories WHERE namespace = ? AND embedding IS NOT NULL',
+            [namespace]
+          )
+          const nsCache = new Map()
+          for (const r of allRows) {
+            nsCache.set(r.id, bufferToVector(r.embedding))
+          }
+          this._embeddingCache.set(namespace, nsCache)
+        }
+        const nsCache = this._embeddingCache.get(namespace)
+
         // Get all memories with embeddings in this namespace
         let sql = 'SELECT * FROM memories WHERE namespace = ? AND embedding IS NOT NULL'
         const params = [namespace]
@@ -423,7 +446,7 @@ export class MemoryStore {
         if (rows.length > 0) {
           // Score each by cosine similarity
           const scored = rows.map(row => {
-            const storedVec = bufferToVector(row.embedding)
+            const storedVec = nsCache.get(row.id) || bufferToVector(row.embedding)
             const score = cosineSimilarity(queryVec, storedVec)
             return { ...this._formatRow(row), score }
           })
@@ -558,6 +581,7 @@ export class MemoryStore {
 
     this._pruneVersions(existing.id)
     this._logUsage('update', namespace, tokens)
+    this._invalidateEmbeddingCache(namespace)
     this._markDirty()
 
     return { id: existing.id, namespace, key, version: newVersion, updated_at: now, tokens }
@@ -576,6 +600,7 @@ export class MemoryStore {
     queryRun(this._db, 'DELETE FROM search_index WHERE memory_id = ?', [existing.id])
     queryRun(this._db, 'DELETE FROM memory_versions WHERE memory_id = ?', [existing.id])
     queryRun(this._db, 'DELETE FROM memories WHERE id = ?', [existing.id])
+    this._invalidateEmbeddingCache(namespace)
     this._markDirty()
     return true
   }
@@ -657,6 +682,7 @@ export class MemoryStore {
     )
     queryRun(this._db, 'DELETE FROM memories WHERE namespace = ?', [namespace])
     queryRun(this._db, 'DELETE FROM usage_log WHERE namespace = ?', [namespace])
+    this._invalidateEmbeddingCache(namespace)
     this._markDirty()
 
     return { confirmed: true, deleted: count }
@@ -712,6 +738,9 @@ export class MemoryStore {
     let skipped = 0
     let overwritten = 0
 
+    this._batchMode = true
+    const affectedNamespaces = new Set()
+
     for (const memory of data.memories) {
       const existing = queryGet(this._db,
         'SELECT id FROM memories WHERE namespace = ? AND key = ?',
@@ -734,7 +763,13 @@ export class MemoryStore {
         memory.tags || [],
         memory.metadata || {}
       )
+      affectedNamespaces.add(memory.namespace)
       imported++
+    }
+
+    this._batchMode = false
+    for (const ns of affectedNamespaces) {
+      this._embeddingCache.delete(ns)
     }
 
     return { imported, skipped, overwritten }
