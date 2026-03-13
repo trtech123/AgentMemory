@@ -32,7 +32,7 @@ import { MemoryStore } from '../src/store.js'
 
 describe('Namespaces', () => {
   let store
-  beforeEach(() => { store = new MemoryStore(':memory:') })
+  beforeEach(async () => { store = new MemoryStore(':memory:'); await store.init() })
   afterEach(() => { store.close() })
 
   it('listNamespaces returns namespaces with correct counts', async () => {
@@ -84,7 +84,7 @@ describe('Namespaces', () => {
 
 describe('Export/Import', () => {
   let store
-  beforeEach(() => { store = new MemoryStore(':memory:') })
+  beforeEach(async () => { store = new MemoryStore(':memory:'); await store.init() })
   afterEach(() => { store.close() })
 
   it('export then import into a fresh store works (roundtrip)', async () => {
@@ -97,6 +97,7 @@ describe('Export/Import', () => {
 
     // Import into a fresh store
     const store2 = new MemoryStore(':memory:')
+    await store2.init()
     try {
       const result = await store2.importMemories(exported)
       expect(result.imported).toBe(2)
@@ -175,7 +176,7 @@ describe('Export/Import', () => {
 
 describe('Summarize', () => {
   let store
-  beforeEach(() => { store = new MemoryStore(':memory:') })
+  beforeEach(async () => { store = new MemoryStore(':memory:'); await store.init() })
   afterEach(() => { store.close() })
 
   it('returns null for empty/nonexistent namespace', async () => {
@@ -209,7 +210,7 @@ describe('Summarize', () => {
 
 describe('Stats', () => {
   let store
-  beforeEach(() => { store = new MemoryStore(':memory:') })
+  beforeEach(async () => { store = new MemoryStore(':memory:'); await store.init() })
   afterEach(() => { store.close() })
 
   it('tracks token usage on store', async () => {

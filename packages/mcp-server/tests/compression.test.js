@@ -45,7 +45,7 @@ const longContent = [
 
 describe('Context Compression', () => {
   let store
-  beforeEach(() => { store = new MemoryStore(':memory:') })
+  beforeEach(async () => { store = new MemoryStore(':memory:'); await store.init() })
   afterEach(() => { store.close() })
 
   describe('auto-summary on store', () => {

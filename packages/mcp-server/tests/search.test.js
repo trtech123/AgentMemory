@@ -32,7 +32,7 @@ import { MemoryStore } from '../src/store.js'
 
 describe('MemoryStore search', () => {
   let store
-  beforeEach(() => { store = new MemoryStore(':memory:') })
+  beforeEach(async () => { store = new MemoryStore(':memory:'); await store.init() })
   afterEach(() => { store.close() })
 
   it('returns empty array when no memories match the query', async () => {
