@@ -112,3 +112,21 @@ describe('MemoryStore search', () => {
     await expect(store.search('', 'some query')).rejects.toThrow(/namespace/)
   })
 })
+
+describe('Binary embedding storage', () => {
+  let store
+  beforeEach(async () => { store = new MemoryStore(':memory:'); await store.init() })
+  afterEach(() => { store.close() })
+
+  it('stores and retrieves embeddings correctly via binary BLOBs', async () => {
+    await store.store('ns', 'doc1', 'the quick brown fox jumps over the lazy dog')
+    await store.store('ns', 'doc2', 'quantum physics wave particle duality')
+
+    // Search should still find the right document
+    const results = await store.search('ns', 'quick brown fox')
+    expect(results.length).toBeGreaterThan(0)
+    expect(results[0].key).toBe('doc1')
+    expect(results[0]).toHaveProperty('score')
+    expect(typeof results[0].score).toBe('number')
+  })
+})

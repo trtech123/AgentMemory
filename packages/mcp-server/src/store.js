@@ -316,11 +316,10 @@ export class MemoryStore {
   }
 
   _upsertEmbedding(memoryId, vector) {
-    // Store embedding as JSON text in the memories table
-    const embeddingJson = JSON.stringify(vector)
+    const blob = vectorToBuffer(vector)
     queryRun(this._db,
       'UPDATE memories SET embedding = ? WHERE id = ?',
-      [embeddingJson, memoryId]
+      [blob, memoryId]
     )
   }
 
@@ -424,7 +423,7 @@ export class MemoryStore {
         if (rows.length > 0) {
           // Score each by cosine similarity
           const scored = rows.map(row => {
-            const storedVec = JSON.parse(row.embedding)
+            const storedVec = bufferToVector(row.embedding)
             const score = cosineSimilarity(queryVec, storedVec)
             return { ...this._formatRow(row), score }
           })
